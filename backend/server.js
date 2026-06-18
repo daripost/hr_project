@@ -264,6 +264,17 @@ app.post('/api/answers', (req, res) => {
   res.json({ ok: true });
 });
 
+app.delete('/api/sessions/:id', requireAuth, (req, res) => {
+  const session = db.prepare('SELECT id FROM sessions WHERE id = ?').get(req.params.id);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+  db.transaction(() => {
+    db.prepare('DELETE FROM paste_attempts WHERE session_id = ?').run(req.params.id);
+    db.prepare('DELETE FROM answers WHERE session_id = ?').run(req.params.id);
+    db.prepare('DELETE FROM sessions WHERE id = ?').run(req.params.id);
+  })();
+  res.json({ ok: true });
+});
+
 app.get('/api/sessions/:id/results', requireAuth, (req, res) => {
   const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(req.params.id);
   if (!session) return res.status(404).json({ error: 'Session not found' });
@@ -491,18 +502,19 @@ app.get('/hr', requireAuth, (req, res) => {
   const sessions = db.prepare('SELECT id, candidate_name, created_at, completed_at FROM sessions ORDER BY created_at DESC').all();
 
   const rows = sessions.length === 0
-    ? '<tr><td colspan="5" style="text-align:center;color:#94a3b8;padding:2rem">Нет пройденных тестов</td></tr>'
+    ? '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Нет пройденных тестов</td></tr>'
     : sessions.map(s => {
         const done = !!s.completed_at;
         const dur = done
           ? Math.round((new Date(s.completed_at) - new Date(s.created_at)) / 60000) + ' мин'
           : '—';
-        return '<tr>' +
+        return '<tr id="row-' + s.id + '">' +
           '<td><strong>' + esc(s.candidate_name) + '</strong></td>' +
           '<td>' + new Date(s.created_at).toLocaleString('ru-RU') + '</td>' +
           '<td>' + (done ? '<span class="status-done">Завершено</span>' : '<span class="status-prog">В процессе</span>') + '</td>' +
           '<td>' + dur + '</td>' +
           '<td><a href="/results/' + s.id + '" target="_blank" class="res-link">Результаты →</a></td>' +
+          '<td><button class="del-btn" onclick="deleteSession(\'' + s.id + '\', \'' + esc(s.candidate_name) + '\')">Удалить</button></td>' +
           '</tr>';
       }).join('');
 
@@ -539,6 +551,9 @@ app.get('/hr', requireAuth, (req, res) => {
   .status-prog{background:#fef3c7;color:#92400e;font-size:.75rem;font-weight:600;padding:3px 10px;border-radius:20px}
   .res-link{color:#2563eb;text-decoration:none;font-weight:500;font-size:.875rem}
   .res-link:hover{text-decoration:underline}
+  .del-btn{background:none;border:1px solid #fecaca;color:#ef4444;font-size:.78rem;font-weight:600;padding:4px 10px;border-radius:6px;cursor:pointer;transition:background .15s,color .15s}
+  .del-btn:hover{background:#fee2e2}
+  .del-btn:disabled{opacity:.4;cursor:default}
 
   /* Редактор вопросов */
   .editor-grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem}
@@ -591,7 +606,7 @@ app.get('/hr', requireAuth, (req, res) => {
       </div>
       <table>
         <thead><tr>
-          <th>Кандидат</th><th>Дата начала</th><th>Статус</th><th>Длительность</th><th>Результаты</th>
+          <th>Кандидат</th><th>Дата начала</th><th>Статус</th><th>Длительность</th><th>Результаты</th><th></th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>
@@ -646,6 +661,25 @@ app.get('/hr', requireAuth, (req, res) => {
 
 <script>
 var questionsData = null;
+
+async function deleteSession(id, name) {
+  if (!confirm('Удалить тест кандидата «' + name + '»?\nЭто действие нельзя отменить.')) return;
+  var btn = document.querySelector('#row-' + id + ' .del-btn');
+  if (btn) { btn.disabled = true; btn.textContent = '...'; }
+  try {
+    var res = await fetch('/api/sessions/' + id, { method: 'DELETE' });
+    if (!res.ok) throw new Error();
+    var row = document.getElementById('row-' + id);
+    if (row) row.remove();
+    var tbody = document.querySelector('tbody');
+    if (tbody && !tbody.querySelector('tr')) {
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Нет пройденных тестов</td></tr>';
+    }
+  } catch(e) {
+    alert('Ошибка при удалении');
+    if (btn) { btn.disabled = false; btn.textContent = 'Удалить'; }
+  }
+}
 
 function switchTab(tab, btn) {
   document.querySelectorAll('.tab-content').forEach(function(el) { el.classList.remove('active'); });
