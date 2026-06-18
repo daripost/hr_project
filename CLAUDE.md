@@ -8,9 +8,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 docker compose up --build
 ```
-- Frontend: http://localhost:3000
-- Backend: http://localhost:3001
-- HR results page: http://localhost:3001/results/<session-id>
 
 **With Node.js (requires `brew install node`):**
 ```bash
@@ -28,47 +25,68 @@ cd frontend && npm run dev    # vite dev server, port 3000
 
 The frontend Vite dev server proxies `/api/*` to `http://localhost:3001`, so no CORS issues in development.
 
+## URLs
+
+- Candidate assessment: `http://localhost:3000`
+- HR dashboard (requires login): `http://localhost:3001/hr`
+- Individual results: `http://localhost:3001/results/<session-id>`
+- AI export: `http://localhost:3001/results/<session-id>/export.json`
+
+## HR credentials
+
+Users are stored in the `hr_users` table with PBKDF2-SHA512 hashed passwords. Register at `/hr/register`. If no users exist yet, the login page shows a prompt to register first. Sessions expire after 8 hours of inactivity; the session store is in-memory so restarts require re-login.
+
 ## Architecture
 
-This is a two-part app: a Node.js/Express backend and a React/Vite frontend. They are completely separate packages with their own `package.json` files.
+Two separate packages: `backend/` (Node.js/Express/CommonJS) and `frontend/` (React/Vite/ESM).
 
 ### Assessment flow (frontend)
 
-`App.jsx` owns a simple screen state machine: `intro → soft → transition → hard → complete`. The `QuestionScreen` component is reused for both blocks, parameterised by `block`, `questions`, and `timeLimit`.
+`App.jsx` is a screen state machine: `loading → intro → soft → transition → hard → complete`. On mount it fetches questions from `/api/questions`; if that fails it falls back to the hardcoded values in `frontend/src/data/questions.js`.
 
-The core timer logic is in `QuestionScreen.jsx`: a `setTimeout`-based countdown decrements `timeLeft` each second. When `timeLeft` reaches 0, `saveAndAdvance(true)` fires automatically — it grabs `canvasRef.current.toDataURL()` (whatever was drawn, even if incomplete), POSTs it to the backend, then advances the index. The candidate can also trigger `saveAndAdvance(false)` manually via the button.
+`QuestionScreen.jsx` is reused for both blocks. The timer uses `setTimeout` decrementing `timeLeft` each second. **Important:** `answer` state is mirrored in `answerRef` so `saveAndAdvance` can read the answer text without being listed as a `useCallback` dependency — this prevents timer resets on every keystroke.
 
-Answer input is a plain `<textarea>` with paste, drop, and context-menu disabled (`onPaste`, `onDrop`, `onContextMenu` all call `e.preventDefault()`). A toast warning appears for 2 seconds when paste is attempted. The textarea auto-focuses on each question change.
+Paste, drop, and context-menu are blocked on the textarea. Each blocked paste attempt fires `POST /api/paste-attempts` to the backend for logging.
 
-All styling is inline JS objects (no CSS modules, no Tailwind). `index.css` only provides global resets.
+All styling is inline JS objects (no CSS modules, no Tailwind).
 
 ### Backend
 
-`backend/server.js` — Express app (CommonJS), port 3001. No auth. All routes:
-- `POST /api/sessions` — creates a session, returns `{ sessionId }`
-- `POST /api/answers` — saves one answer (base64 PNG + metadata)
-- `POST /api/sessions/:id/complete` — stamps `completed_at`
-- `GET /api/sessions` — lists all sessions (for HR tooling)
-- `GET /api/sessions/:id/results` — JSON results
-- `GET /results/:id` — server-rendered HTML report for HR review (shows answer images inline)
+`backend/server.js` — Express app (CommonJS), port 3001. Routes:
 
-`backend/db.js` — initialises better-sqlite3. The DB path is `./assessments.db` locally, or `$DB_PATH` env var (used by Docker to persist to a mounted volume at `/app/data`).
+**Public (candidate-facing):**
+- `POST /api/sessions` — create session
+- `POST /api/answers` — save one answer
+- `POST /api/paste-attempts` — log paste attempt
+- `POST /api/sessions/:id/complete` — stamp `completed_at`
+- `GET /api/questions` — fetch questions and time limits
+
+**Protected by `requireAuth` middleware (HR only):**
+- `GET /hr` — HR dashboard (candidates list + question editor)
+- `GET /hr/login` / `POST /hr/login` — login
+- `GET /hr/register` / `POST /hr/register` — registration (open, no invite needed)
+- `GET /hr/logout` — logout
+- `PUT /api/questions` — update questions
+- `GET /api/sessions` — list all sessions
+- `GET /api/sessions/:id/results` — JSON results
+- `GET /results/:id` — server-rendered HTML results page
+- `GET /results/:id/export.json` — AI-friendly JSON export
+
+Auth uses `cookie-parser` + an in-memory `Map` of `token → { expires }`. Tokens are 32-byte hex strings; cookies are `httpOnly` + `sameSite: strict`.
+
+`backend/db.js` — initialises better-sqlite3. DB path is `./assessments.db` locally or `$DB_PATH` env var (Docker volume). Runs schema migrations on startup (e.g. renames `image_data` → `answer_text` if upgrading from old schema). Seeds default questions if the `questions` table is empty.
 
 ### Database schema
 
 ```
-sessions  — id (uuid), candidate_name, created_at, completed_at
-answers   — session_id, block ('soft'|'hard'), question_index, question_text,
-            answer_text (plain text or null), time_spent (seconds),
-            auto_submitted (0|1)
+hr_users       — id, username (unique), password_hash (salt:pbkdf2hex), created_at
+sessions       — id (uuid), candidate_name, created_at, completed_at
+answers        — session_id, block, question_index, question_text,
+                 answer_text (null if nothing typed), time_spent (s), auto_submitted (0|1)
+questions      — block, order_index, text, time_limit (s)
+paste_attempts — session_id, block, question_index, created_at
 ```
-
-`answer_text` is null when the candidate typed nothing before the timer expired.
 
 ### Questions and time limits
 
-All questions and time constants live in `frontend/src/data/questions.js`:
-- `SOFT_SKILLS` — 9 questions, `SOFT_TIME_LIMIT = 60` seconds
-- `HARD_SKILLS` — 8 questions, `HARD_TIME_LIMIT = 60` seconds
-
-To change questions or time limits, edit only this file.
+Questions and fallback time limits live in `frontend/src/data/questions.js` but are **authoritative in the DB**. The HR dashboard question editor writes to the DB via `PUT /api/questions`. The frontend always fetches from the API on load.

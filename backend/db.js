@@ -28,6 +28,13 @@ const dbPath = process.env.DB_PATH || path.join(__dirname, 'assessments.db');
 const db = new Database(dbPath);
 
 db.exec(`
+  CREATE TABLE IF NOT EXISTS hr_users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
   CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     candidate_name TEXT NOT NULL,
@@ -55,7 +62,26 @@ db.exec(`
     text TEXT NOT NULL,
     time_limit INTEGER NOT NULL DEFAULT 60
   );
+
+  CREATE TABLE IF NOT EXISTS paste_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    block TEXT NOT NULL,
+    question_index INTEGER NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+  );
 `);
+
+// Миграция: переименовать image_data → answer_text если ещё старая схема
+const answerCols = db.prepare('PRAGMA table_info(answers)').all().map(c => c.name);
+if (!answerCols.includes('answer_text')) {
+  if (answerCols.includes('image_data')) {
+    db.exec('ALTER TABLE answers RENAME COLUMN image_data TO answer_text');
+  } else {
+    db.exec('ALTER TABLE answers ADD COLUMN answer_text TEXT');
+  }
+}
 
 // Засеять дефолтные вопросы если таблица пустая
 const { cnt } = db.prepare('SELECT COUNT(*) as cnt FROM questions').get();

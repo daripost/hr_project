@@ -15,15 +15,23 @@ export default function QuestionScreen({
   const [saving, setSaving] = useState(false);
   const startTime = useRef(Date.now());
   const textareaRef = useRef(null);
+  // Ref для текста ответа — чтобы saveAndAdvance не зависел от state answer
+  // и не пересоздавался при каждом нажатии клавиши (что сбрасывало бы таймер)
+  const answerRef = useRef('');
 
   const question = questions[index];
   const total = questions.length;
+
+  const handleAnswerChange = (e) => {
+    answerRef.current = e.target.value;
+    setAnswer(e.target.value);
+  };
 
   const saveAndAdvance = useCallback(async (auto) => {
     if (saving) return;
     setSaving(true);
 
-    const answerText = answer.trim() || null;
+    const answerText = answerRef.current.trim() || null;
     const timeSpent = Math.round((Date.now() - startTime.current) / 1000);
 
     try {
@@ -50,11 +58,12 @@ export default function QuestionScreen({
     } else {
       setIndex(next);
       setTimeLeft(timeLimit);
+      answerRef.current = '';
       setAnswer('');
       startTime.current = Date.now();
     }
     setSaving(false);
-  }, [saving, answer, index, total, block, question, sessionId, timeLimit, onBlockComplete]);
+  }, [saving, index, total, block, question, sessionId, timeLimit, onBlockComplete]);
 
   // Таймер
   useEffect(() => {
@@ -76,6 +85,11 @@ export default function QuestionScreen({
     e.preventDefault();
     setPasteBlocked(true);
     setTimeout(() => setPasteBlocked(false), 2000);
+    fetch('/api/paste-attempts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId, block, questionIndex: index }),
+    }).catch(() => {});
   };
 
   const blockLabel = block === 'soft' ? 'Soft Skills' : 'Hard Skills';
@@ -117,7 +131,7 @@ export default function QuestionScreen({
           <textarea
             ref={textareaRef}
             value={answer}
-            onChange={e => setAnswer(e.target.value)}
+            onChange={handleAnswerChange}
             onPaste={handlePasteAttempt}
             onDrop={handlePasteAttempt}
             onContextMenu={e => e.preventDefault()}
