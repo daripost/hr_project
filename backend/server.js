@@ -51,6 +51,12 @@ const requireAuth = (req, res, next) => {
     }
     hrSessions.delete(token);
   }
+  // Для API-запросов возвращаем 401 JSON, а не редирект на логин.
+  // Иначе fetch следует за редиректом (302→200 HTML), res.ok=true,
+  // и клиент думает что операция прошла успешно — данные не меняются.
+  if (req.path.startsWith('/api/')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
   res.redirect('/hr/login');
 };
 
@@ -382,8 +388,8 @@ app.get('/results/:id', requireAuth, (req, res) => {
   <div class="page-header">
     <div class="candidate-name">${esc(session.candidate_name)}</div>
     <div class="session-meta">
-      <span>Начало: ${new Date(session.created_at).toLocaleString('ru-RU')}</span>
-      <span>${session.completed_at ? 'Завершено: ' + new Date(session.completed_at).toLocaleString('ru-RU') : 'Не завершено'}</span>
+      <span>Начало: <span class="local-date" data-ts="${session.created_at}"></span></span>
+      <span>${session.completed_at ? 'Завершено: <span class="local-date" data-ts="' + session.completed_at + '"></span>' : 'Не завершено'}</span>
     </div>
   </div>
   <div class="summary">
@@ -416,7 +422,9 @@ app.get('/results/:id', requireAuth, (req, res) => {
     <div class="block-title"><span class="dot dot-hard"></span>Hard Skills · ${formatTime(hardTL)} на вопрос</div>
     ${renderAnswers(hardAnswers, 'hard', hardTL)}
   </section>
-</div></body></html>`);
+</div>
+<script>document.querySelectorAll('.local-date[data-ts]').forEach(function(el){var d=new Date(el.getAttribute('data-ts'));el.textContent=d.toLocaleString('ru-RU');});</script>
+</body></html>`);
 });
 
 // ─── Экспорт для AI ──────────────────────────────────────────────────────────
@@ -510,11 +518,11 @@ app.get('/hr', requireAuth, (req, res) => {
           : '—';
         return '<tr id="row-' + s.id + '">' +
           '<td><strong>' + esc(s.candidate_name) + '</strong></td>' +
-          '<td>' + new Date(s.created_at).toLocaleString('ru-RU') + '</td>' +
+          '<td><span class="local-date" data-ts="' + s.created_at + '"></span></td>' +
           '<td>' + (done ? '<span class="status-done">Завершено</span>' : '<span class="status-prog">В процессе</span>') + '</td>' +
           '<td>' + dur + '</td>' +
           '<td><a href="/results/' + s.id + '" target="_blank" class="res-link">Результаты →</a></td>' +
-          '<td><button class="del-btn" onclick="deleteSession(\'' + s.id + '\', \'' + esc(s.candidate_name) + '\')">Удалить</button></td>' +
+          '<td><button class="del-btn" data-sid="' + s.id + '" onclick="deleteSession(\'' + s.id + '\', \'' + esc(s.candidate_name) + '\')">Удалить</button></td>' +
           '</tr>';
       }).join('');
 
@@ -664,11 +672,12 @@ var questionsData = null;
 
 async function deleteSession(id, name) {
   if (!confirm('Удалить тест кандидата «' + name + '»?\nЭто действие нельзя отменить.')) return;
-  var btn = document.querySelector('#row-' + id + ' .del-btn');
+  var btn = document.querySelector('[data-sid="' + id + '"]');
   if (btn) { btn.disabled = true; btn.textContent = '...'; }
   try {
-    var res = await fetch('/api/sessions/' + id, { method: 'DELETE' });
-    if (!res.ok) throw new Error();
+    var res = await fetch('/api/sessions/' + id, { method: 'DELETE', credentials: 'same-origin' });
+    if (res.status === 401) { alert('Сессия истекла — войдите заново.'); location.href = '/hr/login'; return; }
+    if (!res.ok) throw new Error('status ' + res.status);
     var row = document.getElementById('row-' + id);
     if (row) row.remove();
     var tbody = document.querySelector('tbody');
@@ -676,10 +685,18 @@ async function deleteSession(id, name) {
       tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Нет пройденных тестов</td></tr>';
     }
   } catch(e) {
-    alert('Ошибка при удалении');
+    alert('Ошибка при удалении: ' + e.message);
     if (btn) { btn.disabled = false; btn.textContent = 'Удалить'; }
   }
 }
+
+function formatLocalDates() {
+  document.querySelectorAll('.local-date[data-ts]').forEach(function(el) {
+    var d = new Date(el.getAttribute('data-ts'));
+    el.textContent = d.toLocaleString('ru-RU');
+  });
+}
+formatLocalDates();
 
 function switchTab(tab, btn) {
   document.querySelectorAll('.tab-content').forEach(function(el) { el.classList.remove('active'); });
