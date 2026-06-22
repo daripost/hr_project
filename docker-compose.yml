@@ -1,8 +1,8 @@
 services:
   backend:
     build: ./backend
-    ports:
-      - "3001:3001"
+    expose:
+      - "3001"
     volumes:
       - ./backend/data:/app/data
 
