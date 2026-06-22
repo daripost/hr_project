@@ -15,7 +15,8 @@ const esc = (str) => String(str)
   .replace(/&/g, '&amp;')
   .replace(/</g, '&lt;')
   .replace(/>/g, '&gt;')
-  .replace(/"/g, '&quot;');
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&#39;');
 
 // ─── Авторизация HR ───────────────────────────────────────────────────────────
 
@@ -522,7 +523,7 @@ app.get('/hr', requireAuth, (req, res) => {
           '<td>' + (done ? '<span class="status-done">Завершено</span>' : '<span class="status-prog">В процессе</span>') + '</td>' +
           '<td>' + dur + '</td>' +
           '<td><a href="/results/' + s.id + '" target="_blank" class="res-link">Результаты →</a></td>' +
-          '<td><button class="del-btn" data-sid="' + s.id + '" onclick="deleteSession(\'' + s.id + '\', \'' + esc(s.candidate_name) + '\')">Удалить</button></td>' +
+          '<td><button class="del-btn" data-sid="' + s.id + '" data-name="' + esc(s.candidate_name) + '">Удалить</button></td>' +
           '</tr>';
       }).join('');
 
@@ -670,8 +671,15 @@ app.get('/hr', requireAuth, (req, res) => {
 <script>
 var questionsData = null;
 
+// Делегирование: имя кандидата не попадает в inline-onclick (иначе спецсимволы
+// в имени ломали бы парсинг скрипта). Данные берём из data-атрибутов.
+document.addEventListener('click', function(e) {
+  var btn = e.target.closest('.del-btn');
+  if (btn) deleteSession(btn.getAttribute('data-sid'), btn.getAttribute('data-name'));
+});
+
 async function deleteSession(id, name) {
-  if (!confirm('Удалить тест кандидата «' + name + '»?\nЭто действие нельзя отменить.')) return;
+  if (!confirm('Удалить тест кандидата «' + name + '»?\\nЭто действие нельзя отменить.')) return;
   var btn = document.querySelector('[data-sid="' + id + '"]');
   if (btn) { btn.disabled = true; btn.textContent = '...'; }
   try {
