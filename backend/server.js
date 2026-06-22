@@ -100,7 +100,7 @@ app.get('/hr/login', (req, res) => {
     <div class="logo">HR Dashboard</div>
     <h1>Вход</h1>
     <p class="sub">Middle PHP Developer · Оценка кандидатов</p>
-    ${noUsers ? '<div class="alert-info">Пользователей ещё нет — создайте первый аккаунт.</div>' : ''}
+    ${noUsers ? '<div class="alert-info">Пользователей ещё нет — <a href="/hr/register">создайте первый аккаунт</a>.</div>' : ''}
     <form method="POST" action="/hr/login">
       <label>Логин</label>
       <input type="text" name="username" autocomplete="username" autofocus required/>
@@ -108,7 +108,6 @@ app.get('/hr/login', (req, res) => {
       <input type="password" name="password" autocomplete="current-password" required/>
       <button class="btn" type="submit">Войти →</button>
     </form>
-    <div class="link-row"><a href="/hr/register">Зарегистрироваться</a></div>
   `));
 });
 
@@ -137,14 +136,25 @@ app.post('/hr/login', (req, res) => {
   `));
 });
 
-// Регистрация
-app.get('/hr/register', (req, res) => {
+// Регистрация — доступна только при отсутствии пользователей ИЛИ авторизованному HR
+const isLoggedIn = (req) => {
   const token = req.cookies?.hr_session;
-  const sr = token && dbSession.get(token);
-  if (sr && Date.now() < sr.expires_at) return res.redirect('/hr');
+  if (!token) return false;
+  const s = dbSession.get(token);
+  return s && Date.now() < s.expires_at;
+};
+
+const canRegister = (req) => {
+  if (isLoggedIn(req)) return true;
+  return db.prepare('SELECT COUNT(*) as cnt FROM hr_users').get().cnt === 0;
+};
+
+app.get('/hr/register', (req, res) => {
+  if (!canRegister(req)) return res.redirect('/hr/login');
+  const loggedIn = isLoggedIn(req);
   res.send(authPageShell('Регистрация', `
     <div class="logo">HR Dashboard</div>
-    <h1>Регистрация</h1>
+    <h1>${loggedIn ? 'Добавить пользователя' : 'Регистрация'}</h1>
     <p class="sub">Создайте аккаунт для доступа к результатам тестирования</p>
     <form method="POST" action="/hr/register">
       <label>Логин</label>
@@ -154,19 +164,22 @@ app.get('/hr/register', (req, res) => {
       <p class="hint">Минимум 6 символов</p>
       <label>Повторите пароль</label>
       <input type="password" name="password2" autocomplete="new-password" required minlength="6"/>
-      <button class="btn" type="submit">Создать аккаунт →</button>
+      <button class="btn" type="submit">${loggedIn ? 'Создать' : 'Создать аккаунт'} →</button>
     </form>
-    <div class="link-row">Уже есть аккаунт? <a href="/hr/login">Войти</a></div>
+    <div class="link-row">${loggedIn ? '<a href="/hr">← Назад</a>' : 'Уже есть аккаунт? <a href="/hr/login">Войти</a>'}</div>
   `));
 });
 
 app.post('/hr/register', (req, res) => {
+  if (!canRegister(req)) return res.status(403).redirect('/hr/login');
+
   const { username, password, password2 } = req.body;
   const name = username?.trim();
+  const loggedIn = isLoggedIn(req);
 
   const fail = (msg) => res.status(400).send(authPageShell('Регистрация', `
     <div class="logo">HR Dashboard</div>
-    <h1>Регистрация</h1>
+    <h1>${loggedIn ? 'Добавить пользователя' : 'Регистрация'}</h1>
     <p class="sub">Создайте аккаунт для доступа к результатам тестирования</p>
     <div class="alert-error">${esc(msg)}</div>
     <form method="POST" action="/hr/register">
@@ -177,9 +190,9 @@ app.post('/hr/register', (req, res) => {
       <p class="hint">Минимум 6 символов</p>
       <label>Повторите пароль</label>
       <input type="password" name="password2" autocomplete="new-password" required minlength="6"/>
-      <button class="btn" type="submit">Создать аккаунт →</button>
+      <button class="btn" type="submit">${loggedIn ? 'Создать' : 'Создать аккаунт'} →</button>
     </form>
-    <div class="link-row">Уже есть аккаунт? <a href="/hr/login">Войти</a></div>
+    <div class="link-row">${loggedIn ? '<a href="/hr">← Назад</a>' : 'Уже есть аккаунт? <a href="/hr/login">Войти</a>'}</div>
   `));
 
   if (!name || name.length < 3) return fail('Логин должен содержать минимум 3 символа');
@@ -192,6 +205,12 @@ app.post('/hr/register', (req, res) => {
   db.prepare('INSERT INTO hr_users (username, password_hash) VALUES (?, ?)')
     .run(name, hashPassword(password));
 
+  if (loggedIn) {
+    // Уже авторизованный HR добавляет нового пользователя — остаётся в своей сессии
+    return res.redirect('/hr');
+  }
+
+  // Первый пользователь — автоматически логиним
   const token = crypto.randomBytes(32).toString('hex');
   dbSession.set(token, Date.now() + SESSION_TTL);
   res.cookie('hr_session', token, { httpOnly: true, sameSite: 'strict', maxAge: SESSION_TTL });
@@ -607,6 +626,9 @@ app.get('/hr', requireAuth, (req, res) => {
   <button class="nav-btn" data-tab="questions" onclick="switchTab('questions', this)">
     <span class="nav-icon">📝</span> Вопросы теста
   </button>
+  <a href="/hr/register" class="nav-btn" style="text-decoration:none">
+    <span class="nav-icon">👤</span> Добавить HR
+  </a>
   <a href="/hr/logout" class="nav-logout"><span class="nav-icon">↩</span> Выйти</a>
 </nav>
 
