@@ -19,14 +19,19 @@ const esc = (str) => String(str)
 
 // ─── Авторизация HR ───────────────────────────────────────────────────────────
 
-const SESSION_TTL = 8 * 60 * 60 * 1000; // 8 часов
-const hrSessions = new Map();
+const SESSION_TTL = 24 * 60 * 60 * 1000; // 24 часа
 
+// Сессии в БД — переживают перезапуск сервера
+const dbSession = {
+  get: (token) => db.prepare('SELECT expires_at FROM hr_sessions WHERE token = ?').get(token),
+  set: (token, expiresAt) => db.prepare('INSERT OR REPLACE INTO hr_sessions (token, expires_at) VALUES (?, ?)').run(token, expiresAt),
+  touch: (token, expiresAt) => db.prepare('UPDATE hr_sessions SET expires_at = ? WHERE token = ?').run(expiresAt, token),
+  del: (token) => db.prepare('DELETE FROM hr_sessions WHERE token = ?').run(token),
+};
+
+// Чистим протухшие сессии раз в час
 setInterval(() => {
-  const now = Date.now();
-  for (const [token, { expires }] of hrSessions) {
-    if (now > expires) hrSessions.delete(token);
-  }
+  db.prepare('DELETE FROM hr_sessions WHERE expires_at < ?').run(Date.now());
 }, 60 * 60 * 1000);
 
 const hashPassword = (password) => {
@@ -43,13 +48,13 @@ const verifyPassword = (password, stored) => {
 
 const requireAuth = (req, res, next) => {
   const token = req.cookies?.hr_session;
-  if (token && hrSessions.has(token)) {
-    const s = hrSessions.get(token);
-    if (Date.now() < s.expires) {
-      s.expires = Date.now() + SESSION_TTL;
+  if (token) {
+    const s = dbSession.get(token);
+    if (s && Date.now() < s.expires_at) {
+      dbSession.touch(token, Date.now() + SESSION_TTL);
       return next();
     }
-    hrSessions.delete(token);
+    if (s) dbSession.del(token);
   }
   // Для API-запросов возвращаем 401 JSON, а не редирект на логин.
   // Иначе fetch следует за редиректом (302→200 HTML), res.ok=true,
@@ -87,7 +92,8 @@ const authPageShell = (title, content) => `<!DOCTYPE html>
 // Вход
 app.get('/hr/login', (req, res) => {
   const token = req.cookies?.hr_session;
-  if (token && hrSessions.has(token)) return res.redirect('/hr');
+  const s = token && dbSession.get(token);
+  if (s && Date.now() < s.expires_at) return res.redirect('/hr');
   const noUsers = db.prepare('SELECT COUNT(*) as cnt FROM hr_users').get().cnt === 0;
   res.send(authPageShell('Вход', `
     <div class="logo">HR Dashboard</div>
@@ -110,7 +116,7 @@ app.post('/hr/login', (req, res) => {
   const user = db.prepare('SELECT password_hash FROM hr_users WHERE username = ?').get(username?.trim());
   if (user && verifyPassword(password, user.password_hash)) {
     const token = crypto.randomBytes(32).toString('hex');
-    hrSessions.set(token, { expires: Date.now() + SESSION_TTL });
+    dbSession.set(token, Date.now() + SESSION_TTL);
     res.cookie('hr_session', token, { httpOnly: true, sameSite: 'strict', maxAge: SESSION_TTL });
     return res.redirect('/hr');
   }
@@ -133,7 +139,8 @@ app.post('/hr/login', (req, res) => {
 // Регистрация
 app.get('/hr/register', (req, res) => {
   const token = req.cookies?.hr_session;
-  if (token && hrSessions.has(token)) return res.redirect('/hr');
+  const sr = token && dbSession.get(token);
+  if (sr && Date.now() < sr.expires_at) return res.redirect('/hr');
   res.send(authPageShell('Регистрация', `
     <div class="logo">HR Dashboard</div>
     <h1>Регистрация</h1>
@@ -185,7 +192,7 @@ app.post('/hr/register', (req, res) => {
     .run(name, hashPassword(password));
 
   const token = crypto.randomBytes(32).toString('hex');
-  hrSessions.set(token, { expires: Date.now() + SESSION_TTL });
+  dbSession.set(token, Date.now() + SESSION_TTL);
   res.cookie('hr_session', token, { httpOnly: true, sameSite: 'strict', maxAge: SESSION_TTL });
   res.redirect('/hr');
 });
@@ -193,7 +200,7 @@ app.post('/hr/register', (req, res) => {
 // Выход
 app.get('/hr/logout', (req, res) => {
   const token = req.cookies?.hr_session;
-  if (token) hrSessions.delete(token);
+  if (token) dbSession.del(token);
   res.clearCookie('hr_session');
   res.redirect('/hr/login');
 });
@@ -423,7 +430,7 @@ app.get('/results/:id', requireAuth, (req, res) => {
     ${renderAnswers(hardAnswers, 'hard', hardTL)}
   </section>
 </div>
-<script>document.querySelectorAll('.local-date[data-ts]').forEach(function(el){var d=new Date(el.getAttribute('data-ts'));el.textContent=d.toLocaleString('ru-RU');});</script>
+<script>document.querySelectorAll('.local-date[data-ts]').forEach(function(el){var ts=el.getAttribute('data-ts');if(!ts)return;var d=new Date(ts.replace(' ','T')+'Z');el.textContent=isNaN(d)?ts:d.toLocaleString('ru-RU');});</script>
 </body></html>`);
 });
 
@@ -671,7 +678,7 @@ app.get('/hr', requireAuth, (req, res) => {
 var questionsData = null;
 
 async function deleteSession(id, name) {
-  if (!confirm('Удалить тест кандидата «' + name + '»?\nЭто действие нельзя отменить.')) return;
+  if (!confirm('Удалить тест кандидата «' + name + '»?\\nЭто действие нельзя отменить.')) return;
   var btn = document.querySelector('[data-sid="' + id + '"]');
   if (btn) { btn.disabled = true; btn.textContent = '...'; }
   try {
@@ -692,8 +699,10 @@ async function deleteSession(id, name) {
 
 function formatLocalDates() {
   document.querySelectorAll('.local-date[data-ts]').forEach(function(el) {
-    var d = new Date(el.getAttribute('data-ts'));
-    el.textContent = d.toLocaleString('ru-RU');
+    var ts = el.getAttribute('data-ts');
+    if (!ts) return;
+    var d = new Date(ts.replace(' ', 'T') + 'Z');
+    el.textContent = isNaN(d) ? ts : d.toLocaleString('ru-RU');
   });
 }
 formatLocalDates();
@@ -802,6 +811,7 @@ async function saveQuestions() {
     var res = await fetch('/api/questions', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
       body: JSON.stringify(payload)
     });
     if (!res.ok) throw new Error();
