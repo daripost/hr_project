@@ -13,10 +13,10 @@ export default function QuestionScreen({
   const [answer, setAnswer] = useState('');
   const [pasteBlocked, setPasteBlocked] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState(false);
   const startTime = useRef(Date.now());
+  const endTimeRef = useRef(Date.now() + timeLimit * 1000);
   const textareaRef = useRef(null);
-  // Ref для текста ответа — чтобы saveAndAdvance не зависел от state answer
-  // и не пересоздавался при каждом нажатии клавиши (что сбрасывало бы таймер)
   const answerRef = useRef('');
 
   const question = questions[index];
@@ -30,48 +30,52 @@ export default function QuestionScreen({
   const saveAndAdvance = useCallback(async (auto) => {
     if (saving) return;
     setSaving(true);
+    setSaveError(false);
 
     const answerText = answerRef.current.trim() || null;
     const timeSpent = Math.round((Date.now() - startTime.current) / 1000);
+    const payload = { sessionId, block, questionIndex: index, questionText: question, answerText, timeSpent, autoSubmitted: auto };
+    const doFetch = () => fetch('/api/answers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
 
+    let ok = false;
     try {
-      await fetch('/api/answers', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId,
-          block,
-          questionIndex: index,
-          questionText: question,
-          answerText,
-          timeSpent,
-          autoSubmitted: auto,
-        }),
-      });
+      const res = await doFetch();
+      ok = res.ok;
     } catch {
-      // Продолжаем даже при сетевой ошибке
+      await new Promise(r => setTimeout(r, 1200));
+      try { const res2 = await doFetch(); ok = res2.ok; } catch { ok = false; }
     }
+    if (!ok) setSaveError(true);
 
     const next = index + 1;
     if (next >= total) {
       onBlockComplete();
     } else {
+      const now = Date.now();
+      endTimeRef.current = now + timeLimit * 1000;
+      startTime.current = now;
       setIndex(next);
       setTimeLeft(timeLimit);
       answerRef.current = '';
       setAnswer('');
-      startTime.current = Date.now();
     }
     setSaving(false);
   }, [saving, index, total, block, question, sessionId, timeLimit, onBlockComplete]);
 
-  // Таймер
+  // Таймер — использует абсолютное endTime, устойчив к throttling фоновых вкладок
   useEffect(() => {
     if (timeLeft <= 0) {
       saveAndAdvance(true);
       return;
     }
-    const id = setTimeout(() => setTimeLeft(t => t - 1), 1000);
+    const id = setTimeout(() => {
+      const remaining = Math.max(0, Math.ceil((endTimeRef.current - Date.now()) / 1000));
+      setTimeLeft(remaining);
+    }, 500);
     return () => clearTimeout(id);
   }, [timeLeft, saveAndAdvance]);
 
@@ -160,6 +164,11 @@ export default function QuestionScreen({
           )}
         </div>
 
+        {saveError && (
+          <div style={styles.saveError}>
+            ⚠ Ответ мог не сохраниться — проверьте соединение
+          </div>
+        )}
         <div style={styles.footer}>
           <span style={styles.charCount}>{answer.length} символов</span>
           <button
@@ -262,6 +271,15 @@ const styles = {
     background: 'white',
     boxSizing: 'border-box',
     transition: 'border-color 0.2s',
+  },
+  saveError: {
+    background: '#fef3c7',
+    border: '1px solid #fcd34d',
+    borderRadius: '8px',
+    padding: '0.5rem 1rem',
+    fontSize: '0.82rem',
+    color: '#92400e',
+    fontWeight: '500',
   },
   pasteWarning: {
     position: 'absolute',

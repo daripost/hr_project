@@ -79,10 +79,13 @@ db.exec(`
   );
 `);
 
-// Миграция: добавить archived в sessions если его нет
+// Миграции для таблицы sessions
 const candidateSessionCols = db.prepare('PRAGMA table_info(sessions)').all().map(c => c.name);
 if (!candidateSessionCols.includes('archived')) {
   db.exec('ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0');
+}
+if (!candidateSessionCols.includes('notes')) {
+  db.exec('ALTER TABLE sessions ADD COLUMN notes TEXT');
 }
 
 // Миграция: добавить username в hr_sessions если его нет
@@ -110,5 +113,15 @@ if (cnt === 0) {
     HARD_DEFAULTS.forEach((text, i) => ins.run('hard', i, text, 60));
   })();
 }
+
+// Уникальный индекс на answers — защита от дублей при сетевом ретрае
+// Сначала удаляем дубли (оставляем последний по id), потом создаём индекс
+db.exec(`
+  DELETE FROM answers WHERE id NOT IN (
+    SELECT MAX(id) FROM answers GROUP BY session_id, block, question_index
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_answers_unique
+    ON answers(session_id, block, question_index);
+`);
 
 module.exports = db;

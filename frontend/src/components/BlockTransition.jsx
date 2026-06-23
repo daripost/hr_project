@@ -1,3 +1,7 @@
+import { useState, useEffect } from 'react';
+
+const AUTO_START = 180; // 3 минуты
+
 const fmtTime = (sec) => {
   if (sec < 60) return sec + ' секунд';
   const m = Math.floor(sec / 60);
@@ -7,6 +11,17 @@ const fmtTime = (sec) => {
 };
 
 export default function BlockTransition({ onContinue, hardTimeLimit = 60 }) {
+  const [countdown, setCountdown] = useState(AUTO_START);
+
+  useEffect(() => {
+    if (countdown <= 0) { onContinue(); return; }
+    const id = setTimeout(() => setCountdown(c => c - 1), 1000);
+    return () => clearTimeout(id);
+  }, [countdown, onContinue]);
+
+  const mm = String(Math.floor(countdown / 60)).padStart(2, '0');
+  const ss = String(countdown % 60).padStart(2, '0');
+
   return (
     <div style={styles.wrap}>
       <div style={styles.card}>
@@ -17,6 +32,7 @@ export default function BlockTransition({ onContinue, hardTimeLimit = 60 }) {
           У вас будет <strong>{fmtTime(hardTimeLimit)}</strong> на каждый вопрос.
           При истечении времени ответ сохраняется автоматически.
         </p>
+        <p style={styles.countdown}>Автопереход через {mm}:{ss}</p>
         <button style={styles.btn} onClick={onContinue}>
           Начать Hard Skills →
         </button>
@@ -49,6 +65,7 @@ const styles = {
   icon: { fontSize: '3rem' },
   title: { fontSize: '1.5rem', fontWeight: '700', color: '#0f172a' },
   text: { color: '#475569', lineHeight: '1.6', fontSize: '0.95rem' },
+  countdown: { fontSize: '0.85rem', color: '#94a3b8', fontVariantNumeric: 'tabular-nums' },
   btn: {
     marginTop: '0.5rem',
     padding: '0.875rem 2rem',

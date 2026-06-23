@@ -5,6 +5,7 @@ services:
       - "3001"
     volumes:
       - ./backend/data:/app/data
+    restart: unless-stopped
 
   frontend:
     build: ./frontend
@@ -12,3 +13,4 @@ services:
       - "3000:3000"
     depends_on:
       - backend
+    restart: unless-stopped

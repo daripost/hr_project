@@ -1,15 +1,29 @@
 const crypto = require('crypto');
+const path = require('path');
 const express = require('express');
 const cookieParser = require('cookie-parser');
 const cors = require('cors');
+const morgan = require('morgan');
+const rateLimit = require('express-rate-limit');
 const { v4: uuidv4 } = require('uuid');
 const db = require('./db');
 
 const app = express();
-app.use(cors());
+
+const CORS_ORIGIN = process.env.CORS_ORIGIN;
+app.use(cors(CORS_ORIGIN ? { origin: CORS_ORIGIN, credentials: true } : {}));
+app.use(morgan('short'));
 app.use(cookieParser());
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false }));
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  message: { error: 'Слишком много попыток, попробуйте через 15 минут' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 const esc = (str) => String(str)
   .replace(/&/g, '&amp;')
@@ -35,17 +49,22 @@ setInterval(() => {
   db.prepare('DELETE FROM hr_sessions WHERE expires_at < ?').run(Date.now());
 }, 60 * 60 * 1000);
 
-const hashPassword = (password) => {
+const hashPassword = (password) => new Promise((resolve, reject) => {
   const salt = crypto.randomBytes(16).toString('hex');
-  const hash = crypto.pbkdf2Sync(password, salt, 100_000, 64, 'sha512').toString('hex');
-  return `${salt}:${hash}`;
-};
+  crypto.pbkdf2(password, salt, 100_000, 64, 'sha512', (err, key) => {
+    if (err) reject(err);
+    else resolve(`${salt}:${key.toString('hex')}`);
+  });
+});
 
-const verifyPassword = (password, stored) => {
+const verifyPassword = (password, stored) => new Promise((resolve) => {
   const [salt, hash] = stored.split(':');
-  const check = crypto.pbkdf2Sync(password, salt, 100_000, 64, 'sha512').toString('hex');
-  return check === hash;
-};
+  const expected = Buffer.from(hash, 'hex');
+  crypto.pbkdf2(password, salt, 100_000, 64, 'sha512', (err, key) => {
+    if (err || key.length !== expected.length) return resolve(false);
+    resolve(crypto.timingSafeEqual(key, expected));
+  });
+});
 
 const requireAuth = (req, res, next) => {
   const token = req.cookies?.hr_session;
@@ -112,10 +131,10 @@ app.get('/hr/login', (req, res) => {
   `));
 });
 
-app.post('/hr/login', (req, res) => {
+app.post('/hr/login', loginLimiter, async (req, res) => {
   const { username, password } = req.body;
   const user = db.prepare('SELECT password_hash FROM hr_users WHERE username = ?').get(username?.trim());
-  if (user && verifyPassword(password, user.password_hash)) {
+  if (user && await verifyPassword(password, user.password_hash)) {
     const token = crypto.randomBytes(32).toString('hex');
     dbSession.set(token, Date.now() + SESSION_TTL, username?.trim());
     res.cookie('hr_session', token, { httpOnly: true, sameSite: 'strict', maxAge: SESSION_TTL });
@@ -171,7 +190,7 @@ app.get('/hr/register', (req, res) => {
   `));
 });
 
-app.post('/hr/register', (req, res) => {
+app.post('/hr/register', async (req, res) => {
   if (!canRegister(req)) return res.status(403).redirect('/hr/login');
 
   const { username, password, password2 } = req.body;
@@ -204,7 +223,7 @@ app.post('/hr/register', (req, res) => {
   if (exists) return fail('Пользователь с таким логином уже существует');
 
   db.prepare('INSERT INTO hr_users (username, password_hash) VALUES (?, ?)')
-    .run(name, hashPassword(password));
+    .run(name, await hashPassword(password));
 
   if (loggedIn) {
     // Уже авторизованный HR добавляет нового пользователя — остаётся в своей сессии
@@ -336,12 +355,17 @@ app.get('/hr/account', requireAuth, (req, res) => {
         <tbody>${userRows}</tbody>
       </table>
       <a href="/hr/register" style="display:inline-block;margin-top:1rem;font-size:.875rem;color:#2563eb;font-weight:500">+ Добавить пользователя</a>
+    </div>
+    <div class="section">
+      <h2>База данных</h2>
+      <p style="font-size:.85rem;color:#64748b;margin-bottom:1rem">Скачать полный дамп базы данных SQLite для резервного копирования.</p>
+      <a href="/hr/backup" class="btn" style="display:inline-block;text-decoration:none;background:#0f172a">↓ Скачать бэкап БД</a>
     </div>`;
 
   res.send(accountShell(username, content, null));
 });
 
-app.post('/hr/account/username', requireAuth, (req, res) => {
+app.post('/hr/account/username', requireAuth, async (req, res) => {
   const currentUsername = req.hrUser?.username;
   if (!currentUsername) return res.redirect('/hr/login');
   const { new_username, password } = req.body;
@@ -395,7 +419,7 @@ app.post('/hr/account/username', requireAuth, (req, res) => {
   if (!newName || newName.length < 3) return flash(null, 'Логин должен содержать минимум 3 символа');
 
   const user = db.prepare('SELECT password_hash FROM hr_users WHERE username = ?').get(currentUsername);
-  if (!user || !verifyPassword(password, user.password_hash)) return flash(null, 'Неверный пароль');
+  if (!user || !await verifyPassword(password, user.password_hash)) return flash(null, 'Неверный пароль');
 
   if (newName !== currentUsername) {
     const exists = db.prepare('SELECT id FROM hr_users WHERE username = ?').get(newName);
@@ -408,7 +432,7 @@ app.post('/hr/account/username', requireAuth, (req, res) => {
   flash('Логин успешно изменён', null);
 });
 
-app.post('/hr/account/password', requireAuth, (req, res) => {
+app.post('/hr/account/password', requireAuth, async (req, res) => {
   const currentUsername = req.hrUser?.username;
   if (!currentUsername) return res.redirect('/hr/login');
   const { old_password, new_password, new_password2 } = req.body;
@@ -458,11 +482,11 @@ app.post('/hr/account/password', requireAuth, (req, res) => {
   };
 
   const user = db.prepare('SELECT password_hash FROM hr_users WHERE username = ?').get(currentUsername);
-  if (!user || !verifyPassword(old_password, user.password_hash)) return sendPage(null, 'Неверный текущий пароль');
+  if (!user || !await verifyPassword(old_password, user.password_hash)) return sendPage(null, 'Неверный текущий пароль');
   if (!new_password || new_password.length < 6) return sendPage(null, 'Новый пароль должен содержать минимум 6 символов');
   if (new_password !== new_password2) return sendPage(null, 'Пароли не совпадают');
 
-  db.prepare('UPDATE hr_users SET password_hash = ? WHERE username = ?').run(hashPassword(new_password), currentUsername);
+  db.prepare('UPDATE hr_users SET password_hash = ? WHERE username = ?').run(await hashPassword(new_password), currentUsername);
   sendPage('Пароль успешно изменён', null);
 });
 
@@ -507,7 +531,7 @@ app.put('/api/questions', requireAuth, (req, res) => {
 app.post('/api/sessions', (req, res) => {
   const { candidateName } = req.body;
   if (!candidateName?.trim()) return res.status(400).json({ error: 'candidateName is required' });
-  const existing = db.prepare('SELECT id FROM sessions WHERE candidate_name = ?').get(candidateName.trim());
+  const existing = db.prepare('SELECT id FROM sessions WHERE LOWER(candidate_name) = LOWER(?)').get(candidateName.trim());
   if (existing) return res.status(409).json({ error: 'already_exists' });
   const id = uuidv4();
   db.prepare('INSERT INTO sessions (id, candidate_name) VALUES (?, ?)').run(id, candidateName.trim());
@@ -526,13 +550,38 @@ app.post('/api/sessions/:id/archive', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+app.post('/api/sessions/:id/unarchive', requireAuth, (req, res) => {
+  const session = db.prepare('SELECT id FROM sessions WHERE id = ?').get(req.params.id);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+  db.prepare('UPDATE sessions SET archived = 0 WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+app.put('/api/sessions/:id/notes', requireAuth, (req, res) => {
+  const { notes } = req.body;
+  const session = db.prepare('SELECT id FROM sessions WHERE id = ?').get(req.params.id);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+  db.prepare('UPDATE sessions SET notes = ? WHERE id = ?').run(notes || null, req.params.id);
+  res.json({ ok: true });
+});
+
+app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
+
+app.get('/hr/backup', requireAuth, (req, res) => {
+  const dbPath = process.env.DB_PATH || path.join(__dirname, 'assessments.db');
+  const filename = 'hr_backup_' + new Date().toISOString().slice(0, 10) + '.db';
+  res.download(dbPath, filename, (err) => {
+    if (err && !res.headersSent) res.status(500).send('Ошибка при скачивании');
+  });
+});
+
 app.get('/api/sessions/archived', requireAuth, (req, res) => {
-  const sessions = db.prepare('SELECT id, candidate_name, created_at, completed_at FROM sessions WHERE archived = 1 ORDER BY created_at DESC').all();
+  const sessions = db.prepare('SELECT id, candidate_name, created_at, completed_at, notes FROM sessions WHERE archived = 1 ORDER BY created_at DESC').all();
   res.json(sessions);
 });
 
 app.get('/api/sessions', requireAuth, (req, res) => {
-  const sessions = db.prepare('SELECT id, candidate_name, created_at, completed_at FROM sessions WHERE archived = 0 ORDER BY created_at DESC').all();
+  const sessions = db.prepare('SELECT id, candidate_name, created_at, completed_at, notes FROM sessions WHERE archived = 0 ORDER BY created_at DESC').all();
   res.json(sessions);
 });
 
@@ -555,8 +604,10 @@ app.post('/api/answers', (req, res) => {
   if (!sessionId || !block || questionIndex === undefined) {
     return res.status(400).json({ error: 'sessionId, block, questionIndex are required' });
   }
+  const session = db.prepare('SELECT id, completed_at FROM sessions WHERE id = ?').get(sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
   db.prepare(`
-    INSERT INTO answers (session_id, block, question_index, question_text, answer_text, time_spent, auto_submitted)
+    INSERT OR REPLACE INTO answers (session_id, block, question_index, question_text, answer_text, time_spent, auto_submitted)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(sessionId, block, questionIndex, questionText, answerText || null, timeSpent || 0, autoSubmitted ? 1 : 0);
   res.json({ ok: true });
@@ -671,6 +722,12 @@ app.get('/results/:id', requireAuth, (req, res) => {
   .q-text{font-size:.95rem;color:#374151;line-height:1.55;margin-bottom:1rem}
   .answer-text{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:.875rem 1rem;font-size:.95rem;line-height:1.7;color:#1e293b;white-space:pre-wrap;min-height:3rem}
   .answer-empty{color:#94a3b8;font-style:italic}
+  .notes-section{background:white;border-radius:12px;padding:1.25rem 1.5rem;margin-bottom:2rem;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+  .notes-label{font-size:.7rem;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:#94a3b8;margin-bottom:.5rem}
+  .notes-textarea{width:100%;min-height:100px;padding:.75rem 1rem;border:1.5px solid #e2e8f0;border-radius:8px;font-size:.9rem;line-height:1.6;font-family:inherit;resize:vertical;outline:none;transition:border-color .15s;box-sizing:border-box}
+  .notes-textarea:focus{border-color:#2563eb}
+  .save-notes-btn{padding:.45rem 1.1rem;background:#0f172a;color:white;border:none;border-radius:6px;font-size:.8rem;font-weight:600;cursor:pointer;margin-top:.5rem}
+  .save-notes-btn:hover{background:#1e293b}
 </style></head>
 <body><div class="page">
   <div class="top-nav">
@@ -714,8 +771,29 @@ app.get('/results/:id', requireAuth, (req, res) => {
     <div class="block-title"><span class="dot dot-hard"></span>Hard Skills · ${formatTime(hardTL)} на вопрос</div>
     ${renderAnswers(hardAnswers, 'hard', hardTL)}
   </section>
+  <div class="notes-section">
+    <div class="notes-label">Заметки HR</div>
+    <textarea id="hr-notes" class="notes-textarea" placeholder="Добавьте комментарий по кандидату...">${esc(session.notes || '')}</textarea>
+    <div style="display:flex;align-items:center;gap:.75rem">
+      <button class="save-notes-btn" onclick="saveNotes()">Сохранить заметку</button>
+      <span id="notes-status" style="font-size:.82rem"></span>
+    </div>
+  </div>
 </div>
-<script>document.querySelectorAll('.local-date[data-ts]').forEach(function(el){var ts=el.getAttribute('data-ts');if(!ts)return;var d=new Date(ts.replace(' ','T')+'Z');el.textContent=isNaN(d)?ts:d.toLocaleString('ru-RU');});</script>
+<script>
+document.querySelectorAll('.local-date[data-ts]').forEach(function(el){var ts=el.getAttribute('data-ts');if(!ts)return;var d=new Date(ts.replace(' ','T')+'Z');el.textContent=isNaN(d)?ts:d.toLocaleString('ru-RU');});
+async function saveNotes(){
+  var status=document.getElementById('notes-status');
+  status.textContent='Сохранение...'; status.style.color='#64748b';
+  try{
+    var res=await fetch('/api/sessions/${session.id}/notes',{method:'PUT',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({notes:document.getElementById('hr-notes').value})});
+    if(res.ok){status.textContent='Сохранено ✓';status.style.color='#10b981';}
+    else{status.textContent='Ошибка';status.style.color='#ef4444';}
+  }catch(e){status.textContent='Ошибка сети';status.style.color='#ef4444';}
+  setTimeout(function(){status.textContent='';},3000);
+}
+document.getElementById('hr-notes').addEventListener('blur', saveNotes);
+</script>
 </body></html>`);
 });
 
@@ -857,7 +935,8 @@ app.get('/results/:id/export.json', requireAuth, (req, res) => {
 // ─── HR: дашборд ──────────────────────────────────────────────────────────────
 
 app.get('/hr', requireAuth, (req, res) => {
-  const sessions = db.prepare('SELECT id, candidate_name, created_at, completed_at FROM sessions WHERE archived = 0 ORDER BY created_at DESC').all();
+  const sessions = db.prepare('SELECT id, candidate_name, created_at, completed_at, notes FROM sessions WHERE archived = 0 ORDER BY created_at DESC').all();
+  const initialIds = JSON.stringify(sessions.map(s => s.id));
 
   const rows = sessions.length === 0
     ? '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Нет пройденных тестов</td></tr>'
@@ -866,8 +945,8 @@ app.get('/hr', requireAuth, (req, res) => {
         const dur = done
           ? Math.round((new Date(s.completed_at) - new Date(s.created_at)) / 60000) + ' мин'
           : '—';
-        return '<tr id="row-' + s.id + '">' +
-          '<td><strong>' + esc(s.candidate_name) + '</strong></td>' +
+        return '<tr id="row-' + s.id + '" data-name="' + esc(s.candidate_name) + '" data-date="' + (s.created_at || '') + '" data-status="' + (done ? 'done' : 'active') + '">' +
+          '<td><strong>' + esc(s.candidate_name) + '</strong>' + (s.notes ? ' <span class="note-badge" title="' + esc(s.notes) + '">📝</span>' : '') + '</td>' +
           '<td><span class="local-date" data-ts="' + s.created_at + '"></span></td>' +
           '<td>' + (done ? '<span class="status-done">Завершено</span>' : '<span class="status-prog">В процессе</span>') + '</td>' +
           '<td>' + dur + '</td>' +
@@ -912,6 +991,16 @@ app.get('/hr', requireAuth, (req, res) => {
   .arch-btn{background:none;border:1px solid #bfdbfe;color:#2563eb;font-size:.78rem;font-weight:600;padding:4px 10px;border-radius:6px;cursor:pointer;transition:background .15s,color .15s;margin-right:4px}
   .arch-btn:hover{background:#dbeafe}
   .arch-btn:disabled{opacity:.4;cursor:default}
+  .unarch-btn{background:none;border:1px solid #bbf7d0;color:#16a34a;font-size:.78rem;font-weight:600;padding:4px 10px;border-radius:6px;cursor:pointer;transition:background .15s;margin-right:4px}
+  .unarch-btn:hover{background:#dcfce7}
+  .unarch-btn:disabled{opacity:.4;cursor:default}
+  .note-badge{font-size:.85rem;cursor:default;margin-left:4px}
+  .search-input{padding:.45rem .75rem;border:1.5px solid #e2e8f0;border-radius:8px;font-size:.85rem;outline:none;width:220px;font-family:inherit}
+  .search-input:focus{border-color:#2563eb}
+  th.sortable{cursor:pointer;user-select:none}
+  th.sortable:hover{color:#0f172a}
+  .sort-icon{font-size:.7rem;margin-left:3px;color:#94a3b8}
+  .notify-banner{position:fixed;top:1rem;right:1rem;background:#0f172a;color:white;padding:.75rem 1.25rem;border-radius:10px;font-size:.875rem;z-index:1000;display:flex;align-items:center;gap:.75rem;box-shadow:0 4px 20px rgba(0,0,0,.3)}
   .del-btn{background:none;border:1px solid #fecaca;color:#ef4444;font-size:.78rem;font-weight:600;padding:4px 10px;border-radius:6px;cursor:pointer;transition:background .15s,color .15s}
   .del-btn:hover{background:#fee2e2}
   .del-btn:disabled{opacity:.4;cursor:default}
@@ -969,13 +1058,19 @@ app.get('/hr', requireAuth, (req, res) => {
     <div class="table-wrap">
       <div class="table-header">
         <h2>Все тесты</h2>
-        <button class="refresh-btn" onclick="location.reload()">↻ Обновить</button>
+        <div style="display:flex;align-items:center;gap:.75rem">
+          <input type="text" id="search-input" class="search-input" placeholder="Поиск по имени..." oninput="filterCandidates(this.value)"/>
+          <button class="refresh-btn" onclick="location.reload()">↻ Обновить</button>
+        </div>
       </div>
       <table>
         <thead><tr>
-          <th>Кандидат</th><th>Дата начала</th><th>Статус</th><th>Длительность</th><th>Результаты</th><th></th>
+          <th class="sortable" onclick="sortTable('name')">Кандидат <span class="sort-icon" id="sort-name"></span></th>
+          <th class="sortable" onclick="sortTable('date')">Дата начала <span class="sort-icon" id="sort-date">↓</span></th>
+          <th class="sortable" onclick="sortTable('status')">Статус <span class="sort-icon" id="sort-status"></span></th>
+          <th>Длительность</th><th>Результаты</th><th></th>
         </tr></thead>
-        <tbody>${rows}</tbody>
+        <tbody id="candidates-tbody">${rows}</tbody>
       </table>
     </div>
   </div>
@@ -1047,6 +1142,7 @@ app.get('/hr', requireAuth, (req, res) => {
 
 <script>
 var questionsData = null;
+var initialSessionIds = new Set(${initialIds});
 
 function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
@@ -1058,7 +1154,9 @@ document.addEventListener('click', function(e) {
   var btn = e.target.closest('.del-btn');
   if (btn) { deleteSession(btn.getAttribute('data-sid'), btn.getAttribute('data-name')); return; }
   var abtn = e.target.closest('.arch-btn');
-  if (abtn) archiveSession(abtn.getAttribute('data-sid'), abtn.getAttribute('data-name'));
+  if (abtn) { archiveSession(abtn.getAttribute('data-sid'), abtn.getAttribute('data-name')); return; }
+  var ubtn = e.target.closest('.unarch-btn');
+  if (ubtn) unarchiveSession(ubtn.getAttribute('data-sid'), ubtn.getAttribute('data-name'));
 });
 
 async function deleteSession(id, name) {
@@ -1107,6 +1205,92 @@ async function archiveSession(id, name) {
   }
 }
 
+async function unarchiveSession(id, name) {
+  if (!confirm('Вернуть тест «' + name + '» из архива?')) return;
+  var btn = document.querySelector('.unarch-btn[data-sid="' + id + '"]');
+  if (btn) { btn.disabled = true; btn.textContent = '...'; }
+  try {
+    var res = await fetch('/api/sessions/' + id + '/unarchive', { method: 'POST', credentials: 'same-origin' });
+    if (res.status === 401) { location.href = '/hr/login'; return; }
+    if (!res.ok) throw new Error();
+    var row = document.getElementById('row-' + id);
+    if (row) {
+      var tbody = row.parentNode;
+      row.remove();
+      if (tbody && !tbody.querySelector('tr')) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Архив пуст</td></tr>';
+      }
+    }
+  } catch(e) {
+    alert('Ошибка: ' + e.message);
+    if (btn) { btn.disabled = false; btn.textContent = 'Из архива'; }
+  }
+}
+
+// ─── Поиск и сортировка кандидатов ─────────────────────────────────────────
+
+function filterCandidates(query) {
+  var q = query.toLowerCase().trim();
+  var rows = document.querySelectorAll('#candidates-tbody tr[data-name]');
+  var visible = 0;
+  rows.forEach(function(row) {
+    var match = !q || row.getAttribute('data-name').toLowerCase().includes(q);
+    row.style.display = match ? '' : 'none';
+    if (match) visible++;
+  });
+  var empty = document.getElementById('search-empty-row');
+  if (visible === 0 && rows.length > 0) {
+    if (!empty) {
+      empty = document.createElement('tr');
+      empty.id = 'search-empty-row';
+      empty.innerHTML = '<td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Ничего не найдено</td>';
+    }
+    document.getElementById('candidates-tbody').appendChild(empty);
+  } else if (empty) {
+    empty.remove();
+  }
+}
+
+var sortState = { col: 'date', dir: -1 };
+function sortTable(col) {
+  if (sortState.col === col) { sortState.dir *= -1; }
+  else { sortState.col = col; sortState.dir = col === 'date' ? -1 : 1; }
+  document.querySelectorAll('.sort-icon').forEach(function(el) { el.textContent = ''; });
+  var icon = document.getElementById('sort-' + col);
+  if (icon) icon.textContent = sortState.dir === 1 ? '↑' : '↓';
+  var tbody = document.getElementById('candidates-tbody');
+  var rows = Array.from(tbody.querySelectorAll('tr[data-name]'));
+  rows.sort(function(a, b) {
+    var av = a.getAttribute('data-' + col) || '';
+    var bv = b.getAttribute('data-' + col) || '';
+    return sortState.dir * av.localeCompare(bv, 'ru');
+  });
+  rows.forEach(function(row) { tbody.appendChild(row); });
+}
+
+// ─── Авто-уведомление о новых результатах ───────────────────────────────────
+
+async function checkNewSessions() {
+  try {
+    var res = await fetch('/api/sessions', { credentials: 'same-origin' });
+    if (!res.ok) return;
+    var data = await res.json();
+    var newCompleted = data.filter(function(s) { return s.completed_at && !initialSessionIds.has(s.id); });
+    if (newCompleted.length > 0) {
+      var old = document.getElementById('notify-banner');
+      if (old) old.remove();
+      var banner = document.createElement('div');
+      banner.id = 'notify-banner';
+      banner.className = 'notify-banner';
+      banner.innerHTML = '<span>🔔 Новых результатов: ' + newCompleted.length + '</span>' +
+        '<button onclick="location.reload()" style="background:#2563eb;color:white;border:none;padding:.35rem .9rem;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:600">Обновить</button>' +
+        '<button onclick="this.parentNode.remove()" style="background:transparent;color:#94a3b8;border:none;cursor:pointer;font-size:1.2rem;line-height:1">×</button>';
+      document.body.appendChild(banner);
+    }
+  } catch(e) {}
+}
+setInterval(checkNewSessions, 60000);
+
 var archiveLoaded = false;
 async function loadArchive(force) {
   if (archiveLoaded && !force) return;
@@ -1129,7 +1313,7 @@ async function loadArchive(force) {
           '<td>' + (done ? '<span class="status-done">Завершено</span>' : '<span class="status-prog">В процессе</span>') + '</td>' +
           '<td>' + dur + '</td>' +
           '<td><a href="/results/' + s.id + '" target="_blank" class="res-link">Результаты →</a></td>' +
-          '<td><button class="del-btn" data-sid="' + s.id + '" data-name="' + escHtml(s.candidate_name) + '">Удалить</button></td>' +
+          '<td><button class="unarch-btn" data-sid="' + s.id + '" data-name="' + escHtml(s.candidate_name) + '">Из архива</button><button class="del-btn" data-sid="' + s.id + '" data-name="' + escHtml(s.candidate_name) + '">Удалить</button></td>' +
           '</tr>';
       }).join('');
       formatLocalDates();
