@@ -70,6 +70,12 @@ export default function App() {
             Повторное прохождение не предусмотрено.
           </p>
           <p style={stylesApp.sub}>Если вы считаете, что это ошибка — обратитесь к HR.</p>
+          <button
+            style={stylesApp.resetBtn}
+            onClick={() => { localStorage.removeItem(STORAGE_KEY); setScreen('intro'); setPrevAttempt(null); }}
+          >
+            Начать заново
+          </button>
         </div>
       </div>
     );
@@ -156,4 +162,5 @@ const stylesApp = {
   title: { fontSize: '1.5rem', fontWeight: '700', color: '#0f172a' },
   text: { color: '#475569', lineHeight: '1.6', fontSize: '0.95rem' },
   sub: { color: '#94a3b8', fontSize: '0.85rem' },
+  resetBtn: { marginTop: '0.5rem', background: 'none', border: '1px solid #e2e8f0', borderRadius: '8px', padding: '0.5rem 1.25rem', fontSize: '0.8rem', color: '#64748b', cursor: 'pointer' },
 };
