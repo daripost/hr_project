@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: hr-assessment
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter          # starter = 512 MB RAM, поддерживает persistent disk
+    region: frankfurt      # ближайший к РФ
+    healthCheckPath: /api/health
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DB_PATH
+        value: /data/assessments.db
+      - key: SESSION_SECRET
+        generateValue: true   # Render сгенерирует случайное значение
+      - key: CORS_ORIGIN
+        value: ""             # оставить пустым — при деплое замените на ваш домен, напр. https://hr-assessment.onrender.com
+
+    disk:
+      name: sqlite-data
+      mountPath: /data
+      sizeGB: 1

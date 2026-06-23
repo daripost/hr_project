@@ -17,6 +17,11 @@ app.use(cookieParser());
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false }));
 
+// В продакшене отдаём собранный React из ./public
+if (process.env.NODE_ENV === 'production') {
+  app.use(express.static(path.join(__dirname, 'public')));
+}
+
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
@@ -1460,5 +1465,5 @@ async function saveQuestions() {
 </body></html>`);
 });
 
-const PORT = 3001;
-app.listen(PORT, () => console.log('Backend running on http://localhost:' + PORT));
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => console.log('Backend running on port ' + PORT));
