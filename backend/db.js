@@ -37,7 +37,8 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS hr_sessions (
     token TEXT PRIMARY KEY,
-    expires_at INTEGER NOT NULL
+    expires_at INTEGER NOT NULL,
+    username TEXT
   );
 
   CREATE TABLE IF NOT EXISTS sessions (
@@ -77,6 +78,18 @@ db.exec(`
     FOREIGN KEY (session_id) REFERENCES sessions(id)
   );
 `);
+
+// Миграция: добавить archived в sessions если его нет
+const candidateSessionCols = db.prepare('PRAGMA table_info(sessions)').all().map(c => c.name);
+if (!candidateSessionCols.includes('archived')) {
+  db.exec('ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0');
+}
+
+// Миграция: добавить username в hr_sessions если его нет
+const sessionCols = db.prepare('PRAGMA table_info(hr_sessions)').all().map(c => c.name);
+if (!sessionCols.includes('username')) {
+  db.exec('ALTER TABLE hr_sessions ADD COLUMN username TEXT');
+}
 
 // Миграция: переименовать image_data → answer_text если ещё старая схема
 const answerCols = db.prepare('PRAGMA table_info(answers)').all().map(c => c.name);

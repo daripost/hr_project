@@ -24,8 +24,8 @@ const SESSION_TTL = 24 * 60 * 60 * 1000; // 24 часа
 
 // Сессии в БД — переживают перезапуск сервера
 const dbSession = {
-  get: (token) => db.prepare('SELECT expires_at FROM hr_sessions WHERE token = ?').get(token),
-  set: (token, expiresAt) => db.prepare('INSERT OR REPLACE INTO hr_sessions (token, expires_at) VALUES (?, ?)').run(token, expiresAt),
+  get: (token) => db.prepare('SELECT expires_at, username FROM hr_sessions WHERE token = ?').get(token),
+  set: (token, expiresAt, username) => db.prepare('INSERT OR REPLACE INTO hr_sessions (token, expires_at, username) VALUES (?, ?, ?)').run(token, expiresAt, username || null),
   touch: (token, expiresAt) => db.prepare('UPDATE hr_sessions SET expires_at = ? WHERE token = ?').run(expiresAt, token),
   del: (token) => db.prepare('DELETE FROM hr_sessions WHERE token = ?').run(token),
 };
@@ -53,6 +53,7 @@ const requireAuth = (req, res, next) => {
     const s = dbSession.get(token);
     if (s && Date.now() < s.expires_at) {
       dbSession.touch(token, Date.now() + SESSION_TTL);
+      req.hrUser = s.username ? { username: s.username } : null;
       return next();
     }
     if (s) dbSession.del(token);
@@ -116,7 +117,7 @@ app.post('/hr/login', (req, res) => {
   const user = db.prepare('SELECT password_hash FROM hr_users WHERE username = ?').get(username?.trim());
   if (user && verifyPassword(password, user.password_hash)) {
     const token = crypto.randomBytes(32).toString('hex');
-    dbSession.set(token, Date.now() + SESSION_TTL);
+    dbSession.set(token, Date.now() + SESSION_TTL, username?.trim());
     res.cookie('hr_session', token, { httpOnly: true, sameSite: 'strict', maxAge: SESSION_TTL });
     return res.redirect('/hr');
   }
@@ -207,12 +208,12 @@ app.post('/hr/register', (req, res) => {
 
   if (loggedIn) {
     // Уже авторизованный HR добавляет нового пользователя — остаётся в своей сессии
-    return res.redirect('/hr');
+    return res.redirect('/hr/account');
   }
 
   // Первый пользователь — автоматически логиним
   const token = crypto.randomBytes(32).toString('hex');
-  dbSession.set(token, Date.now() + SESSION_TTL);
+  dbSession.set(token, Date.now() + SESSION_TTL, name);
   res.cookie('hr_session', token, { httpOnly: true, sameSite: 'strict', maxAge: SESSION_TTL });
   res.redirect('/hr');
 });
@@ -223,6 +224,256 @@ app.get('/hr/logout', (req, res) => {
   if (token) dbSession.del(token);
   res.clearCookie('hr_session');
   res.redirect('/hr/login');
+});
+
+// ─── Аккаунт HR ─────────────────────────────────────────────────────────────
+
+const accountShell = (username, content, flash) => `<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>HR · Аккаунт</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:system-ui,sans-serif;background:#f1f5f9;color:#1e293b}
+  .sidebar{position:fixed;top:0;left:0;width:220px;height:100vh;background:#0f172a;padding:1.5rem 1rem;display:flex;flex-direction:column;gap:.25rem}
+  .sidebar-logo{color:white;font-weight:700;font-size:1rem;padding:.75rem .75rem 1.25rem}
+  .sidebar-logo span{display:block;font-size:.7rem;font-weight:400;color:#94a3b8;margin-top:2px}
+  .nav-btn{display:flex;align-items:center;gap:.625rem;padding:.625rem .75rem;border-radius:8px;border:none;background:transparent;color:#94a3b8;font-size:.875rem;font-weight:500;cursor:pointer;width:100%;text-align:left;transition:background .15s,color .15s;text-decoration:none}
+  .nav-btn:hover{background:#1e293b;color:white}
+  .nav-btn.active{background:#1e3a5f;color:#60a5fa}
+  .nav-icon{font-size:1rem;width:18px;text-align:center}
+  .nav-logout{display:flex;align-items:center;gap:.625rem;padding:.625rem .75rem;border-radius:8px;border:none;background:transparent;color:#64748b;font-size:.8rem;cursor:pointer;width:100%;text-align:left;margin-top:auto;text-decoration:none}
+  .nav-logout:hover{background:#1e293b;color:#f87171}
+  .main{margin-left:220px;padding:2rem;max-width:860px}
+  h1{font-size:1.35rem;font-weight:700;margin-bottom:1.5rem}
+  .section{background:white;border-radius:14px;box-shadow:0 1px 4px rgba(0,0,0,.07);padding:1.5rem 2rem;margin-bottom:1.25rem}
+  .section h2{font-size:.9rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#64748b;margin-bottom:1.25rem}
+  label{display:block;font-size:.8rem;font-weight:600;color:#374151;margin-bottom:.3rem;margin-top:.75rem}
+  label:first-of-type{margin-top:0}
+  input[type=text],input[type=password]{width:100%;max-width:340px;padding:.65rem .9rem;border:1.5px solid #e2e8f0;border-radius:8px;font-size:.9rem;outline:none;transition:border-color .15s;font-family:inherit}
+  input:focus{border-color:#2563eb}
+  .btn{padding:.65rem 1.5rem;background:#2563eb;color:white;border:none;border-radius:8px;font-size:.875rem;font-weight:600;cursor:pointer;margin-top:1rem}
+  .btn:hover{background:#1d4ed8}
+  .btn-danger{background:#ef4444}
+  .btn-danger:hover{background:#dc2626}
+  .btn-sm{padding:.4rem .9rem;font-size:.78rem;margin-top:0}
+  .alert-ok{background:#d1fae5;color:#065f46;font-size:.82rem;padding:.5rem .9rem;border-radius:8px;margin-bottom:1rem}
+  .alert-err{background:#fee2e2;color:#991b1b;font-size:.82rem;padding:.5rem .9rem;border-radius:8px;margin-bottom:1rem}
+  table{width:100%;border-collapse:collapse}
+  th{text-align:left;font-size:.75rem;font-weight:600;color:#64748b;letter-spacing:.04em;text-transform:uppercase;padding:.6rem 1rem;border-bottom:1px solid #f1f5f9}
+  td{padding:.75rem 1rem;font-size:.875rem;border-bottom:1px solid #f8fafc;vertical-align:middle}
+  tr:last-child td{border-bottom:none}
+  .you-badge{font-size:.7rem;background:#dbeafe;color:#1d4ed8;padding:2px 8px;border-radius:20px;font-weight:600;margin-left:.5rem}
+</style></head>
+<body>
+<nav class="sidebar">
+  <div class="sidebar-logo">HR Dashboard<span>Middle PHP Developer</span></div>
+  <a href="/hr" class="nav-btn"><span class="nav-icon">👥</span> Кандидаты</a>
+  <a href="/hr/account" class="nav-btn active"><span class="nav-icon">⚙️</span> Аккаунт</a>
+  <a href="/hr/logout" class="nav-logout"><span class="nav-icon">↩</span> Выйти</a>
+</nav>
+<div class="main">
+  <h1>Аккаунт</h1>
+  ${flash ? (flash.ok ? '<div class="alert-ok">' + esc(flash.ok) + '</div>' : '<div class="alert-err">' + esc(flash.err) + '</div>') : ''}
+  ${content}
+</div>
+<script>
+async function deleteUser(id, name) {
+  if (!confirm('Удалить пользователя «' + name + '»?\\nЭто действие нельзя отменить.')) return;
+  var btn = document.querySelector('[data-uid="' + id + '"]');
+  if (btn) { btn.disabled = true; btn.textContent = '...'; }
+  var res = await fetch('/api/hr/users/' + id, { method: 'DELETE', credentials: 'same-origin' });
+  if (res.ok) {
+    var row = document.getElementById('urow-' + id);
+    if (row) row.remove();
+  } else {
+    if (btn) { btn.disabled = false; btn.textContent = 'Удалить'; }
+    alert('Ошибка при удалении');
+  }
+}
+</script>
+</body></html>`;
+
+app.get('/hr/account', requireAuth, (req, res) => {
+  const username = req.hrUser?.username || '?';
+  const allUsers = db.prepare('SELECT id, username, created_at FROM hr_users ORDER BY created_at').all();
+
+  const userRows = allUsers.map(u => {
+    const isMe = u.username === username;
+    return '<tr id="urow-' + u.id + '">' +
+      '<td>' + esc(u.username) + (isMe ? '<span class="you-badge">вы</span>' : '') + '</td>' +
+      '<td style="color:#64748b;font-size:.8rem">' + (u.created_at || '—') + '</td>' +
+      '<td>' + (!isMe ? '<button class="btn btn-danger btn-sm" data-uid="' + u.id + '" onclick="deleteUser(' + u.id + ', \'' + esc(u.username) + '\')">Удалить</button>' : '') + '</td>' +
+      '</tr>';
+  }).join('');
+
+  const content = `
+    <div class="section">
+      <h2>Сменить логин</h2>
+      <form method="POST" action="/hr/account/username">
+        <label>Новый логин</label>
+        <input type="text" name="new_username" value="${esc(username)}" required minlength="3" maxlength="50"/>
+        <label>Текущий пароль</label>
+        <input type="password" name="password" required/>
+        <button class="btn" type="submit">Сохранить логин</button>
+      </form>
+    </div>
+    <div class="section">
+      <h2>Сменить пароль</h2>
+      <form method="POST" action="/hr/account/password">
+        <label>Текущий пароль</label>
+        <input type="password" name="old_password" required/>
+        <label>Новый пароль</label>
+        <input type="password" name="new_password" required minlength="6"/>
+        <label>Повторите новый пароль</label>
+        <input type="password" name="new_password2" required minlength="6"/>
+        <button class="btn" type="submit">Сменить пароль</button>
+      </form>
+    </div>
+    <div class="section">
+      <h2>Пользователи</h2>
+      <table>
+        <thead><tr><th>Логин</th><th>Создан</th><th></th></tr></thead>
+        <tbody>${userRows}</tbody>
+      </table>
+      <a href="/hr/register" style="display:inline-block;margin-top:1rem;font-size:.875rem;color:#2563eb;font-weight:500">+ Добавить пользователя</a>
+    </div>`;
+
+  res.send(accountShell(username, content, null));
+});
+
+app.post('/hr/account/username', requireAuth, (req, res) => {
+  const currentUsername = req.hrUser?.username;
+  if (!currentUsername) return res.redirect('/hr/login');
+  const { new_username, password } = req.body;
+  const newName = new_username?.trim();
+
+  const flash = (ok, err) => {
+    const allUsers = db.prepare('SELECT id, username, created_at FROM hr_users ORDER BY created_at').all();
+    const username = ok ? newName : currentUsername;
+    const userRows = allUsers.map(u => {
+      const isMe = u.username === username;
+      return '<tr id="urow-' + u.id + '">' +
+        '<td>' + esc(u.username) + (isMe ? '<span class="you-badge">вы</span>' : '') + '</td>' +
+        '<td style="color:#64748b;font-size:.8rem">' + (u.created_at || '—') + '</td>' +
+        '<td>' + (!isMe ? '<button class="btn btn-danger btn-sm" data-uid="' + u.id + '" onclick="deleteUser(' + u.id + ', \'' + esc(u.username) + '\')">Удалить</button>' : '') + '</td>' +
+        '</tr>';
+    }).join('');
+    const content = `
+      <div class="section">
+        <h2>Сменить логин</h2>
+        <form method="POST" action="/hr/account/username">
+          <label>Новый логин</label>
+          <input type="text" name="new_username" value="${esc(username)}" required minlength="3" maxlength="50"/>
+          <label>Текущий пароль</label>
+          <input type="password" name="password" required/>
+          <button class="btn" type="submit">Сохранить логин</button>
+        </form>
+      </div>
+      <div class="section">
+        <h2>Сменить пароль</h2>
+        <form method="POST" action="/hr/account/password">
+          <label>Текущий пароль</label>
+          <input type="password" name="old_password" required/>
+          <label>Новый пароль</label>
+          <input type="password" name="new_password" required minlength="6"/>
+          <label>Повторите новый пароль</label>
+          <input type="password" name="new_password2" required minlength="6"/>
+          <button class="btn" type="submit">Сменить пароль</button>
+        </form>
+      </div>
+      <div class="section">
+        <h2>Пользователи</h2>
+        <table>
+          <thead><tr><th>Логин</th><th>Создан</th><th></th></tr></thead>
+          <tbody>${userRows}</tbody>
+        </table>
+        <a href="/hr/register" style="display:inline-block;margin-top:1rem;font-size:.875rem;color:#2563eb;font-weight:500">+ Добавить пользователя</a>
+      </div>`;
+    res.send(accountShell(username, content, ok ? { ok } : { err }));
+  };
+
+  if (!newName || newName.length < 3) return flash(null, 'Логин должен содержать минимум 3 символа');
+
+  const user = db.prepare('SELECT password_hash FROM hr_users WHERE username = ?').get(currentUsername);
+  if (!user || !verifyPassword(password, user.password_hash)) return flash(null, 'Неверный пароль');
+
+  if (newName !== currentUsername) {
+    const exists = db.prepare('SELECT id FROM hr_users WHERE username = ?').get(newName);
+    if (exists) return flash(null, 'Пользователь с таким логином уже существует');
+    db.prepare('UPDATE hr_users SET username = ? WHERE username = ?').run(newName, currentUsername);
+    // Обновляем имя в текущей сессии
+    const token = req.cookies?.hr_session;
+    if (token) db.prepare('UPDATE hr_sessions SET username = ? WHERE token = ?').run(newName, token);
+  }
+  flash('Логин успешно изменён', null);
+});
+
+app.post('/hr/account/password', requireAuth, (req, res) => {
+  const currentUsername = req.hrUser?.username;
+  if (!currentUsername) return res.redirect('/hr/login');
+  const { old_password, new_password, new_password2 } = req.body;
+
+  const sendPage = (ok, err) => {
+    const allUsers = db.prepare('SELECT id, username, created_at FROM hr_users ORDER BY created_at').all();
+    const userRows = allUsers.map(u => {
+      const isMe = u.username === currentUsername;
+      return '<tr id="urow-' + u.id + '">' +
+        '<td>' + esc(u.username) + (isMe ? '<span class="you-badge">вы</span>' : '') + '</td>' +
+        '<td style="color:#64748b;font-size:.8rem">' + (u.created_at || '—') + '</td>' +
+        '<td>' + (!isMe ? '<button class="btn btn-danger btn-sm" data-uid="' + u.id + '" onclick="deleteUser(' + u.id + ', \'' + esc(u.username) + '\')">Удалить</button>' : '') + '</td>' +
+        '</tr>';
+    }).join('');
+    const content = `
+      <div class="section">
+        <h2>Сменить логин</h2>
+        <form method="POST" action="/hr/account/username">
+          <label>Новый логин</label>
+          <input type="text" name="new_username" value="${esc(currentUsername)}" required minlength="3" maxlength="50"/>
+          <label>Текущий пароль</label>
+          <input type="password" name="password" required/>
+          <button class="btn" type="submit">Сохранить логин</button>
+        </form>
+      </div>
+      <div class="section">
+        <h2>Сменить пароль</h2>
+        <form method="POST" action="/hr/account/password">
+          <label>Текущий пароль</label>
+          <input type="password" name="old_password" required/>
+          <label>Новый пароль</label>
+          <input type="password" name="new_password" required minlength="6"/>
+          <label>Повторите новый пароль</label>
+          <input type="password" name="new_password2" required minlength="6"/>
+          <button class="btn" type="submit">Сменить пароль</button>
+        </form>
+      </div>
+      <div class="section">
+        <h2>Пользователи</h2>
+        <table>
+          <thead><tr><th>Логин</th><th>Создан</th><th></th></tr></thead>
+          <tbody>${userRows}</tbody>
+        </table>
+        <a href="/hr/register" style="display:inline-block;margin-top:1rem;font-size:.875rem;color:#2563eb;font-weight:500">+ Добавить пользователя</a>
+      </div>`;
+    res.send(accountShell(currentUsername, content, ok ? { ok } : { err }));
+  };
+
+  const user = db.prepare('SELECT password_hash FROM hr_users WHERE username = ?').get(currentUsername);
+  if (!user || !verifyPassword(old_password, user.password_hash)) return sendPage(null, 'Неверный текущий пароль');
+  if (!new_password || new_password.length < 6) return sendPage(null, 'Новый пароль должен содержать минимум 6 символов');
+  if (new_password !== new_password2) return sendPage(null, 'Пароли не совпадают');
+
+  db.prepare('UPDATE hr_users SET password_hash = ? WHERE username = ?').run(hashPassword(new_password), currentUsername);
+  sendPage('Пароль успешно изменён', null);
+});
+
+app.delete('/api/hr/users/:id', requireAuth, (req, res) => {
+  const currentUsername = req.hrUser?.username;
+  const target = db.prepare('SELECT id, username FROM hr_users WHERE id = ?').get(req.params.id);
+  if (!target) return res.status(404).json({ error: 'User not found' });
+  if (target.username === currentUsername) return res.status(400).json({ error: 'Cannot delete yourself' });
+  db.prepare('DELETE FROM hr_sessions WHERE username = ?').run(target.username);
+  db.prepare('DELETE FROM hr_users WHERE id = ?').run(target.id);
+  res.json({ ok: true });
 });
 
 // ─── Вопросы ────────────────────────────────────────────────────────────────
@@ -256,6 +507,8 @@ app.put('/api/questions', requireAuth, (req, res) => {
 app.post('/api/sessions', (req, res) => {
   const { candidateName } = req.body;
   if (!candidateName?.trim()) return res.status(400).json({ error: 'candidateName is required' });
+  const existing = db.prepare('SELECT id FROM sessions WHERE candidate_name = ?').get(candidateName.trim());
+  if (existing) return res.status(409).json({ error: 'already_exists' });
   const id = uuidv4();
   db.prepare('INSERT INTO sessions (id, candidate_name) VALUES (?, ?)').run(id, candidateName.trim());
   res.json({ sessionId: id });
@@ -266,8 +519,20 @@ app.post('/api/sessions/:id/complete', (req, res) => {
   res.json({ ok: true });
 });
 
+app.post('/api/sessions/:id/archive', requireAuth, (req, res) => {
+  const session = db.prepare('SELECT id FROM sessions WHERE id = ?').get(req.params.id);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+  db.prepare('UPDATE sessions SET archived = 1 WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+app.get('/api/sessions/archived', requireAuth, (req, res) => {
+  const sessions = db.prepare('SELECT id, candidate_name, created_at, completed_at FROM sessions WHERE archived = 1 ORDER BY created_at DESC').all();
+  res.json(sessions);
+});
+
 app.get('/api/sessions', requireAuth, (req, res) => {
-  const sessions = db.prepare('SELECT id, candidate_name, created_at, completed_at FROM sessions ORDER BY created_at DESC').all();
+  const sessions = db.prepare('SELECT id, candidate_name, created_at, completed_at FROM sessions WHERE archived = 0 ORDER BY created_at DESC').all();
   res.json(sessions);
 });
 
@@ -410,7 +675,7 @@ app.get('/results/:id', requireAuth, (req, res) => {
 <body><div class="page">
   <div class="top-nav">
     <a href="/hr" class="back">← Все кандидаты</a>
-    <a href="/results/${session.id}/export.json" class="export-btn" download>↓ Экспорт для AI (JSON)</a>
+    <a href="/results/${session.id}/export.txt" class="export-btn" download>↓ Скачать результаты (TXT)</a>
   </div>
   <div class="page-header">
     <div class="candidate-name">${esc(session.candidate_name)}</div>
@@ -454,7 +719,65 @@ app.get('/results/:id', requireAuth, (req, res) => {
 </body></html>`);
 });
 
-// ─── Экспорт для AI ──────────────────────────────────────────────────────────
+// ─── Экспорт TXT ─────────────────────────────────────────────────────────────
+
+app.get('/results/:id/export.txt', requireAuth, (req, res) => {
+  const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(req.params.id);
+  if (!session) return res.status(404).send('Session not found');
+
+  const answers = db.prepare('SELECT * FROM answers WHERE session_id = ? ORDER BY block, question_index').all(req.params.id);
+  const pastes  = db.prepare('SELECT block, question_index FROM paste_attempts WHERE session_id = ?').all(req.params.id);
+  const softTL  = db.prepare("SELECT time_limit FROM questions WHERE block='soft' LIMIT 1").get()?.time_limit ?? 60;
+  const hardTL  = db.prepare("SELECT time_limit FROM questions WHERE block='hard' LIMIT 1").get()?.time_limit ?? 60;
+  const softAnswers = answers.filter(a => a.block === 'soft');
+  const hardAnswers = answers.filter(a => a.block === 'hard');
+
+  const fmtTime = (sec) => {
+    if (!sec && sec !== 0) return '—';
+    if (sec >= 60) { const m = Math.floor(sec / 60), s = sec % 60; return s ? m + ' мин ' + s + ' с' : m + ' мин'; }
+    return sec + ' с';
+  };
+  const pasteCount = (block, qi) => pastes.filter(p => p.block === block && p.question_index === qi).length;
+
+  const lines = [];
+  lines.push('РЕЗУЛЬТАТЫ ТЕСТИРОВАНИЯ');
+  lines.push('='.repeat(60));
+  lines.push('Кандидат: ' + session.candidate_name);
+  lines.push('Начало: ' + (session.created_at || '—'));
+  lines.push('Завершено: ' + (session.completed_at || 'нет'));
+  lines.push('');
+
+  const renderBlock = (items, block, timeLimit, title) => {
+    lines.push(title);
+    lines.push('-'.repeat(40));
+    items.forEach((a, i) => {
+      const pc = pasteCount(block, a.question_index);
+      lines.push('');
+      lines.push('Вопрос ' + (i + 1) + ':');
+      lines.push(a.question_text);
+      lines.push('');
+      lines.push('Ответ:');
+      lines.push(a.answer_text || '(ответ не был записан)');
+      lines.push('');
+      const meta = ['Время: ' + fmtTime(a.time_spent) + ' из ' + fmtTime(timeLimit)];
+      if (a.auto_submitted) meta.push('[время вышло]'); else meta.push('[сам перешёл]');
+      if (pc > 0) meta.push('попыток вставить: ' + pc);
+      lines.push(meta.join(' '));
+      lines.push('- '.repeat(30).trim());
+    });
+  };
+
+  renderBlock(softAnswers, 'soft', softTL, 'SOFT SKILLS');
+  lines.push('');
+  renderBlock(hardAnswers, 'hard', hardTL, 'HARD SKILLS');
+
+  const filename = 'assessment_' + session.candidate_name.replace(/\s+/g, '_') + '_' + session.id.slice(0, 8) + '.txt';
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
+  res.send(lines.join('\n'));
+});
+
+// ─── Экспорт для AI (JSON) ────────────────────────────────────────────────────
 
 app.get('/results/:id/export.json', requireAuth, (req, res) => {
   const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(req.params.id);
@@ -534,7 +857,7 @@ app.get('/results/:id/export.json', requireAuth, (req, res) => {
 // ─── HR: дашборд ──────────────────────────────────────────────────────────────
 
 app.get('/hr', requireAuth, (req, res) => {
-  const sessions = db.prepare('SELECT id, candidate_name, created_at, completed_at FROM sessions ORDER BY created_at DESC').all();
+  const sessions = db.prepare('SELECT id, candidate_name, created_at, completed_at FROM sessions WHERE archived = 0 ORDER BY created_at DESC').all();
 
   const rows = sessions.length === 0
     ? '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Нет пройденных тестов</td></tr>'
@@ -549,7 +872,7 @@ app.get('/hr', requireAuth, (req, res) => {
           '<td>' + (done ? '<span class="status-done">Завершено</span>' : '<span class="status-prog">В процессе</span>') + '</td>' +
           '<td>' + dur + '</td>' +
           '<td><a href="/results/' + s.id + '" target="_blank" class="res-link">Результаты →</a></td>' +
-          '<td><button class="del-btn" data-sid="' + s.id + '" data-name="' + esc(s.candidate_name) + '">Удалить</button></td>' +
+          '<td><button class="arch-btn" data-sid="' + s.id + '" data-name="' + esc(s.candidate_name) + '">В архив</button> <button class="del-btn" data-sid="' + s.id + '" data-name="' + esc(s.candidate_name) + '">Удалить</button></td>' +
           '</tr>';
       }).join('');
 
@@ -586,6 +909,9 @@ app.get('/hr', requireAuth, (req, res) => {
   .status-prog{background:#fef3c7;color:#92400e;font-size:.75rem;font-weight:600;padding:3px 10px;border-radius:20px}
   .res-link{color:#2563eb;text-decoration:none;font-weight:500;font-size:.875rem}
   .res-link:hover{text-decoration:underline}
+  .arch-btn{background:none;border:1px solid #bfdbfe;color:#2563eb;font-size:.78rem;font-weight:600;padding:4px 10px;border-radius:6px;cursor:pointer;transition:background .15s,color .15s;margin-right:4px}
+  .arch-btn:hover{background:#dbeafe}
+  .arch-btn:disabled{opacity:.4;cursor:default}
   .del-btn{background:none;border:1px solid #fecaca;color:#ef4444;font-size:.78rem;font-weight:600;padding:4px 10px;border-radius:6px;cursor:pointer;transition:background .15s,color .15s}
   .del-btn:hover{background:#fee2e2}
   .del-btn:disabled{opacity:.4;cursor:default}
@@ -626,8 +952,11 @@ app.get('/hr', requireAuth, (req, res) => {
   <button class="nav-btn" data-tab="questions" onclick="switchTab('questions', this)">
     <span class="nav-icon">📝</span> Вопросы теста
   </button>
-  <a href="/hr/register" class="nav-btn" style="text-decoration:none">
-    <span class="nav-icon">👤</span> Добавить HR
+  <button class="nav-btn" data-tab="archive" onclick="switchTab('archive', this)">
+    <span class="nav-icon">📦</span> Архив
+  </button>
+  <a href="/hr/account" class="nav-btn" style="text-decoration:none">
+    <span class="nav-icon">⚙️</span> Аккаунт
   </a>
   <a href="/hr/logout" class="nav-logout"><span class="nav-icon">↩</span> Выйти</a>
 </nav>
@@ -695,35 +1024,119 @@ app.get('/hr', requireAuth, (req, res) => {
     </div>
   </div>
 
+  <!-- Архив -->
+  <div id="tab-archive" class="tab-content">
+    <h1>Архив</h1>
+    <div class="table-wrap">
+      <div class="table-header">
+        <h2>Архивные тесты</h2>
+        <button class="refresh-btn" onclick="loadArchive(true)">↻ Обновить</button>
+      </div>
+      <table>
+        <thead><tr>
+          <th>Кандидат</th><th>Дата начала</th><th>Статус</th><th>Длительность</th><th>Результаты</th><th></th>
+        </tr></thead>
+        <tbody id="archive-tbody">
+          <tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Загрузка...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
 </div>
 
 <script>
 var questionsData = null;
 
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
 // Делегирование: имя кандидата не попадает в inline-onclick (иначе спецсимволы
 // в имени ломали бы парсинг скрипта). Данные берём из data-атрибутов.
 document.addEventListener('click', function(e) {
   var btn = e.target.closest('.del-btn');
-  if (btn) deleteSession(btn.getAttribute('data-sid'), btn.getAttribute('data-name'));
+  if (btn) { deleteSession(btn.getAttribute('data-sid'), btn.getAttribute('data-name')); return; }
+  var abtn = e.target.closest('.arch-btn');
+  if (abtn) archiveSession(abtn.getAttribute('data-sid'), abtn.getAttribute('data-name'));
 });
 
 async function deleteSession(id, name) {
   if (!confirm('Удалить тест кандидата «' + name + '»?\\nЭто действие нельзя отменить.')) return;
-  var btn = document.querySelector('[data-sid="' + id + '"]');
+  var btn = document.querySelector('.del-btn[data-sid="' + id + '"]');
   if (btn) { btn.disabled = true; btn.textContent = '...'; }
   try {
     var res = await fetch('/api/sessions/' + id, { method: 'DELETE', credentials: 'same-origin' });
     if (res.status === 401) { alert('Сессия истекла — войдите заново.'); location.href = '/hr/login'; return; }
     if (!res.ok) throw new Error('status ' + res.status);
     var row = document.getElementById('row-' + id);
-    if (row) row.remove();
-    var tbody = document.querySelector('tbody');
-    if (tbody && !tbody.querySelector('tr')) {
-      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Нет пройденных тестов</td></tr>';
+    if (row) {
+      var tbody = row.parentNode;
+      row.remove();
+      if (tbody && !tbody.querySelector('tr')) {
+        var inArchive = tbody.id === 'archive-tbody';
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">' + (inArchive ? 'Архив пуст' : 'Нет пройденных тестов') + '</td></tr>';
+      }
     }
   } catch(e) {
     alert('Ошибка при удалении: ' + e.message);
     if (btn) { btn.disabled = false; btn.textContent = 'Удалить'; }
+  }
+}
+
+async function archiveSession(id, name) {
+  if (!confirm('Переместить тест кандидата «' + name + '» в архив?')) return;
+  var btn = document.querySelector('.arch-btn[data-sid="' + id + '"]');
+  if (btn) { btn.disabled = true; btn.textContent = '...'; }
+  try {
+    var res = await fetch('/api/sessions/' + id + '/archive', { method: 'POST', credentials: 'same-origin' });
+    if (res.status === 401) { alert('Сессия истекла — войдите заново.'); location.href = '/hr/login'; return; }
+    if (!res.ok) throw new Error('status ' + res.status);
+    var row = document.getElementById('row-' + id);
+    if (row) {
+      var tbody = row.parentNode;
+      row.remove();
+      if (tbody && !tbody.querySelector('tr')) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Нет пройденных тестов</td></tr>';
+      }
+    }
+    archiveLoaded = false;
+  } catch(e) {
+    alert('Ошибка при архивировании: ' + e.message);
+    if (btn) { btn.disabled = false; btn.textContent = 'В архив'; }
+  }
+}
+
+var archiveLoaded = false;
+async function loadArchive(force) {
+  if (archiveLoaded && !force) return;
+  var tbody = document.getElementById('archive-tbody');
+  tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Загрузка...</td></tr>';
+  try {
+    var res = await fetch('/api/sessions/archived', { credentials: 'same-origin' });
+    if (res.status === 401) { location.href = '/hr/login'; return; }
+    if (!res.ok) throw new Error();
+    var sessions = await res.json();
+    if (!sessions.length) {
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Архив пуст</td></tr>';
+    } else {
+      tbody.innerHTML = sessions.map(function(s) {
+        var done = !!s.completed_at;
+        var dur = done ? Math.round((new Date(s.completed_at) - new Date(s.created_at)) / 60000) + ' мин' : '—';
+        return '<tr id="row-' + s.id + '">' +
+          '<td><strong>' + escHtml(s.candidate_name) + '</strong></td>' +
+          '<td><span class="local-date" data-ts="' + s.created_at + '"></span></td>' +
+          '<td>' + (done ? '<span class="status-done">Завершено</span>' : '<span class="status-prog">В процессе</span>') + '</td>' +
+          '<td>' + dur + '</td>' +
+          '<td><a href="/results/' + s.id + '" target="_blank" class="res-link">Результаты →</a></td>' +
+          '<td><button class="del-btn" data-sid="' + s.id + '" data-name="' + escHtml(s.candidate_name) + '">Удалить</button></td>' +
+          '</tr>';
+      }).join('');
+      formatLocalDates();
+    }
+    archiveLoaded = true;
+  } catch(e) {
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Ошибка загрузки</td></tr>';
   }
 }
 
@@ -743,6 +1156,7 @@ function switchTab(tab, btn) {
   document.getElementById('tab-' + tab).classList.add('active');
   btn.classList.add('active');
   if (tab === 'questions' && !questionsData) loadQuestions();
+  if (tab === 'archive') loadArchive(false);
 }
 
 async function loadQuestions() {

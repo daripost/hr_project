@@ -42,6 +42,7 @@ export default function App() {
   const handleStart = (sid, name) => {
     setSessionId(sid);
     setCandidateName(name);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ name, startedAt: Date.now() }));
     setScreen('soft');
   };
 
@@ -49,7 +50,8 @@ export default function App() {
 
   const handleHardComplete = async () => {
     try { await fetch('/api/sessions/' + sessionId + '/complete', { method: 'POST' }); } catch { /* ignore */ }
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ name: candidateName, completedAt: Date.now() }));
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...stored, completedAt: Date.now() }));
     setScreen('complete');
   };
 

@@ -81,6 +81,17 @@ export default function QuestionScreen({
     textareaRef.current?.focus();
   }, [index]);
 
+  // Блокируем копирование текста страницы (textarea оставляем рабочей)
+  useEffect(() => {
+    const blockCopy = (e) => { if (e.target.tagName !== 'TEXTAREA') e.preventDefault(); };
+    document.addEventListener('copy', blockCopy);
+    document.addEventListener('cut', blockCopy);
+    return () => {
+      document.removeEventListener('copy', blockCopy);
+      document.removeEventListener('cut', blockCopy);
+    };
+  }, []);
+
   const handlePasteAttempt = (e) => {
     e.preventDefault();
     setPasteBlocked(true);
@@ -231,6 +242,7 @@ const styles = {
     lineHeight: '1.6',
     color: '#1e293b',
     fontWeight: '500',
+    userSelect: 'none',
   },
   textareaWrap: {
     position: 'relative',

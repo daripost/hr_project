@@ -26,6 +26,10 @@ export default function Intro({ onStart, softTimeLimit = 60, hardTimeLimit = 60 
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ candidateName: trimmed }),
       });
+      if (res.status === 409) {
+        setError('Тест с таким именем уже был пройден. Повторное прохождение не предусмотрено.');
+        return;
+      }
       if (!res.ok) throw new Error('Ошибка сервера');
       const { sessionId } = await res.json();
       onStart(sessionId, trimmed);
