@@ -773,7 +773,7 @@ app.get('/results/:id/export.txt', requireAuth, (req, res) => {
 
   const filename = 'assessment_' + session.candidate_name.replace(/\s+/g, '_') + '_' + session.id.slice(0, 8) + '.txt';
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-  res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
+  res.setHeader('Content-Disposition', "attachment; filename*=UTF-8''" + encodeURIComponent(filename));
   res.send(lines.join('\n'));
 });
 
@@ -850,7 +850,7 @@ app.get('/results/:id/export.json', requireAuth, (req, res) => {
 
   const filename = `assessment_${session.candidate_name.replace(/\s+/g, '_')}_${session.id.slice(0, 8)}.json`;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.setHeader('Content-Disposition', "attachment; filename*=UTF-8''" + encodeURIComponent(filename));
   res.send(JSON.stringify(payload, null, 2));
 });
 
