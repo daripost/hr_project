@@ -11,17 +11,24 @@ const FALLBACK = {
   hard: { timeLimit: 60, questions: HARD_SKILLS },
 };
 
+const STORAGE_KEY = 'hr_assessment_done';
+
 export default function App() {
   const [screen, setScreen] = useState('loading');
   const [questions, setQuestions] = useState(null);
   const [sessionId, setSessionId] = useState(null);
   const [candidateName, setCandidateName] = useState('');
+  const [prevAttempt, setPrevAttempt] = useState(null);
 
   useEffect(() => {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored) {
+      try { setPrevAttempt(JSON.parse(stored)); } catch { localStorage.removeItem(STORAGE_KEY); }
+    }
     fetch('/api/questions')
       .then(r => r.json())
-      .then(data => { setQuestions(data); setScreen('intro'); })
-      .catch(() => { setQuestions(FALLBACK); setScreen('intro'); });
+      .then(data => { setQuestions(data); setScreen(stored ? 'already_done' : 'intro'); })
+      .catch(() => { setQuestions(FALLBACK); setScreen(stored ? 'already_done' : 'intro'); });
   }, []);
 
   if (screen === 'loading') {
@@ -42,8 +49,29 @@ export default function App() {
 
   const handleHardComplete = async () => {
     try { await fetch('/api/sessions/' + sessionId + '/complete', { method: 'POST' }); } catch { /* ignore */ }
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ name: candidateName, completedAt: Date.now() }));
     setScreen('complete');
   };
+
+  if (screen === 'already_done') {
+    const date = prevAttempt?.completedAt
+      ? new Date(prevAttempt.completedAt).toLocaleString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' })
+      : null;
+    return (
+      <div style={stylesApp.wrap}>
+        <div style={stylesApp.card}>
+          <div style={stylesApp.icon}>⚠️</div>
+          <h2 style={stylesApp.title}>Вы уже проходили тестирование</h2>
+          <p style={stylesApp.text}>
+            {prevAttempt?.name && <><strong>{prevAttempt.name}</strong>, вы{' '}</>}
+            уже проходили это тестирование{date && <> {date}</>}.
+            Повторное прохождение не предусмотрено.
+          </p>
+          <p style={stylesApp.sub}>Если вы считаете, что это ошибка — обратитесь к HR.</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <>
@@ -98,4 +126,32 @@ const styles = {
     color: '#94a3b8',
     fontSize: '1rem',
   },
+};
+
+const stylesApp = {
+  wrap: {
+    minHeight: '100vh',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: '1.5rem',
+    background: '#f1f5f9',
+  },
+  card: {
+    background: 'white',
+    borderRadius: '16px',
+    padding: '2.5rem',
+    maxWidth: '480px',
+    width: '100%',
+    textAlign: 'center',
+    boxShadow: '0 4px 24px rgba(0,0,0,0.08)',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '0.75rem',
+    alignItems: 'center',
+  },
+  icon: { fontSize: '3rem' },
+  title: { fontSize: '1.5rem', fontWeight: '700', color: '#0f172a' },
+  text: { color: '#475569', lineHeight: '1.6', fontSize: '0.95rem' },
+  sub: { color: '#94a3b8', fontSize: '0.85rem' },
 };
