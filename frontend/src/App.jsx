@@ -70,12 +70,14 @@ export default function App() {
             Повторное прохождение не предусмотрено.
           </p>
           <p style={stylesApp.sub}>Если вы считаете, что это ошибка — обратитесь к HR.</p>
-          <button
-            style={stylesApp.resetBtn}
-            onClick={() => { localStorage.removeItem(STORAGE_KEY); setScreen('intro'); setPrevAttempt(null); }}
-          >
-            Начать заново
-          </button>
+          {new URLSearchParams(window.location.search).has('lion9973') && (
+            <button
+              style={stylesApp.resetBtn}
+              onClick={() => { localStorage.removeItem(STORAGE_KEY); setScreen('intro'); setPrevAttempt(null); }}
+            >
+              Начать заново
+            </button>
+          )}
         </div>
       </div>
     );
