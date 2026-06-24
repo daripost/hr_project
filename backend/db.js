@@ -1,5 +1,4 @@
-const Database = require('better-sqlite3');
-const path = require('path');
+const { Pool } = require('pg');
 
 const SOFT_DEFAULTS = [
   'Расскажите о случае, когда вам пришлось разрешать конфликт внутри команды. Что вы сделали и к чему это привело?',
@@ -24,107 +23,84 @@ const HARD_DEFAULTS = [
   'Как реализовать асинхронность в PHP? Назовите известные инструменты и подходы.',
 ];
 
-const dbPath = process.env.DB_PATH || path.join(__dirname, 'assessments.db');
-const db = new Database(dbPath);
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+});
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS hr_users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+async function init() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS hr_users (
+      id SERIAL PRIMARY KEY,
+      username TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS hr_sessions (
+      token TEXT PRIMARY KEY,
+      expires_at BIGINT NOT NULL,
+      username TEXT
+    );
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      candidate_name TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      completed_at TIMESTAMPTZ,
+      archived BOOLEAN NOT NULL DEFAULT FALSE,
+      notes TEXT
+    );
+    CREATE TABLE IF NOT EXISTS answers (
+      id SERIAL PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id),
+      block TEXT NOT NULL,
+      question_index INTEGER NOT NULL,
+      question_text TEXT NOT NULL,
+      answer_text TEXT,
+      time_spent INTEGER,
+      auto_submitted BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(session_id, block, question_index)
+    );
+    CREATE TABLE IF NOT EXISTS questions (
+      id SERIAL PRIMARY KEY,
+      block TEXT NOT NULL,
+      order_index INTEGER NOT NULL,
+      text TEXT NOT NULL,
+      time_limit INTEGER NOT NULL DEFAULT 120
+    );
+    CREATE TABLE IF NOT EXISTS paste_attempts (
+      id SERIAL PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id),
+      block TEXT NOT NULL,
+      question_index INTEGER NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
 
-  CREATE TABLE IF NOT EXISTS hr_sessions (
-    token TEXT PRIMARY KEY,
-    expires_at INTEGER NOT NULL,
-    username TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    candidate_name TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    completed_at DATETIME
-  );
-
-  CREATE TABLE IF NOT EXISTS answers (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    block TEXT NOT NULL,
-    question_index INTEGER NOT NULL,
-    question_text TEXT NOT NULL,
-    answer_text TEXT,
-    time_spent INTEGER,
-    auto_submitted INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (session_id) REFERENCES sessions(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS questions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    block TEXT NOT NULL,
-    order_index INTEGER NOT NULL,
-    text TEXT NOT NULL,
-    time_limit INTEGER NOT NULL DEFAULT 120
-  );
-
-  CREATE TABLE IF NOT EXISTS paste_attempts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    block TEXT NOT NULL,
-    question_index INTEGER NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (session_id) REFERENCES sessions(id)
-  );
-`);
-
-// Миграции для таблицы sessions
-const candidateSessionCols = db.prepare('PRAGMA table_info(sessions)').all().map(c => c.name);
-if (!candidateSessionCols.includes('archived')) {
-  db.exec('ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0');
-}
-if (!candidateSessionCols.includes('notes')) {
-  db.exec('ALTER TABLE sessions ADD COLUMN notes TEXT');
-}
-
-// Миграция: добавить username в hr_sessions если его нет
-const sessionCols = db.prepare('PRAGMA table_info(hr_sessions)').all().map(c => c.name);
-if (!sessionCols.includes('username')) {
-  db.exec('ALTER TABLE hr_sessions ADD COLUMN username TEXT');
-}
-
-// Миграция: переименовать image_data → answer_text если ещё старая схема
-const answerCols = db.prepare('PRAGMA table_info(answers)').all().map(c => c.name);
-if (!answerCols.includes('answer_text')) {
-  if (answerCols.includes('image_data')) {
-    db.exec('ALTER TABLE answers RENAME COLUMN image_data TO answer_text');
-  } else {
-    db.exec('ALTER TABLE answers ADD COLUMN answer_text TEXT');
+  const { rows } = await pool.query('SELECT COUNT(*) AS cnt FROM questions');
+  if (parseInt(rows[0].cnt) === 0) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (let i = 0; i < SOFT_DEFAULTS.length; i++) {
+        await client.query(
+          'INSERT INTO questions (block, order_index, text, time_limit) VALUES ($1, $2, $3, $4)',
+          ['soft', i, SOFT_DEFAULTS[i], 120]
+        );
+      }
+      for (let i = 0; i < HARD_DEFAULTS.length; i++) {
+        await client.query(
+          'INSERT INTO questions (block, order_index, text, time_limit) VALUES ($1, $2, $3, $4)',
+          ['hard', i, HARD_DEFAULTS[i], 120]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
   }
 }
 
-// Миграция: обновить time_limit до 120 если ещё стоит старый дефолт 60
-db.exec('UPDATE questions SET time_limit = 120 WHERE time_limit = 60');
-
-// Засеять дефолтные вопросы если таблица пустая
-const { cnt } = db.prepare('SELECT COUNT(*) as cnt FROM questions').get();
-if (cnt === 0) {
-  const ins = db.prepare('INSERT INTO questions (block, order_index, text, time_limit) VALUES (?, ?, ?, ?)');
-  db.transaction(() => {
-    SOFT_DEFAULTS.forEach((text, i) => ins.run('soft', i, text, 120));
-    HARD_DEFAULTS.forEach((text, i) => ins.run('hard', i, text, 120));
-  })();
-}
-
-// Уникальный индекс на answers — защита от дублей при сетевом ретрае
-// Сначала удаляем дубли (оставляем последний по id), потом создаём индекс
-db.exec(`
-  DELETE FROM answers WHERE id NOT IN (
-    SELECT MAX(id) FROM answers GROUP BY session_id, block, question_index
-  );
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_answers_unique
-    ON answers(session_id, block, question_index);
-`);
-
-module.exports = db;
+module.exports = { pool, init };

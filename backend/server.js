@@ -1,3 +1,4 @@
+require('express-async-errors');
 const crypto = require('crypto');
 const path = require('path');
 const express = require('express');
@@ -6,7 +7,7 @@ const cors = require('cors');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const { v4: uuidv4 } = require('uuid');
-const db = require('./db');
+const { pool, init } = require('./db');
 
 const app = express();
 
@@ -17,7 +18,6 @@ app.use(cookieParser());
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false }));
 
-// В продакшене отдаём собранный React из ./public
 if (process.env.NODE_ENV === 'production') {
   app.use(express.static(path.join(__dirname, 'public')));
 }
@@ -37,21 +37,37 @@ const esc = (str) => String(str)
   .replace(/"/g, '&quot;')
   .replace(/'/g, '&#39;');
 
+const toISO = (d) => d ? new Date(d).toISOString() : '';
+const fmtDate = (d) => d ? new Date(d).toISOString().slice(0, 19).replace('T', ' ') : '—';
+
 // ─── Авторизация HR ───────────────────────────────────────────────────────────
 
-const SESSION_TTL = 24 * 60 * 60 * 1000; // 24 часа
+const SESSION_TTL = 24 * 60 * 60 * 1000;
 
-// Сессии в БД — переживают перезапуск сервера
 const dbSession = {
-  get: (token) => db.prepare('SELECT expires_at, username FROM hr_sessions WHERE token = ?').get(token),
-  set: (token, expiresAt, username) => db.prepare('INSERT OR REPLACE INTO hr_sessions (token, expires_at, username) VALUES (?, ?, ?)').run(token, expiresAt, username || null),
-  touch: (token, expiresAt) => db.prepare('UPDATE hr_sessions SET expires_at = ? WHERE token = ?').run(expiresAt, token),
-  del: (token) => db.prepare('DELETE FROM hr_sessions WHERE token = ?').run(token),
+  get: async (token) => {
+    const { rows } = await pool.query(
+      'SELECT expires_at, username FROM hr_sessions WHERE token = $1', [token]
+    );
+    return rows[0] || null;
+  },
+  set: async (token, expiresAt, username) => {
+    await pool.query(
+      `INSERT INTO hr_sessions (token, expires_at, username) VALUES ($1, $2, $3)
+       ON CONFLICT (token) DO UPDATE SET expires_at = EXCLUDED.expires_at, username = EXCLUDED.username`,
+      [token, expiresAt, username || null]
+    );
+  },
+  touch: async (token, expiresAt) => {
+    await pool.query('UPDATE hr_sessions SET expires_at = $1 WHERE token = $2', [expiresAt, token]);
+  },
+  del: async (token) => {
+    await pool.query('DELETE FROM hr_sessions WHERE token = $1', [token]);
+  },
 };
 
-// Чистим протухшие сессии раз в час
-setInterval(() => {
-  db.prepare('DELETE FROM hr_sessions WHERE expires_at < ?').run(Date.now());
+setInterval(async () => {
+  await pool.query('DELETE FROM hr_sessions WHERE expires_at < $1', [Date.now()]).catch(() => {});
 }, 60 * 60 * 1000);
 
 const hashPassword = (password) => new Promise((resolve, reject) => {
@@ -71,24 +87,25 @@ const verifyPassword = (password, stored) => new Promise((resolve) => {
   });
 });
 
-const requireAuth = (req, res, next) => {
-  const token = req.cookies?.hr_session;
-  if (token) {
-    const s = dbSession.get(token);
-    if (s && Date.now() < s.expires_at) {
-      dbSession.touch(token, Date.now() + SESSION_TTL);
-      req.hrUser = s.username ? { username: s.username } : null;
-      return next();
+const requireAuth = async (req, res, next) => {
+  try {
+    const token = req.cookies?.hr_session;
+    if (token) {
+      const s = await dbSession.get(token);
+      if (s && Date.now() < Number(s.expires_at)) {
+        await dbSession.touch(token, Date.now() + SESSION_TTL);
+        req.hrUser = s.username ? { username: s.username } : null;
+        return next();
+      }
+      if (s) await dbSession.del(token);
     }
-    if (s) dbSession.del(token);
+    if (req.path.startsWith('/api/')) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    res.redirect('/hr/login');
+  } catch (err) {
+    next(err);
   }
-  // Для API-запросов возвращаем 401 JSON, а не редирект на логин.
-  // Иначе fetch следует за редиректом (302→200 HTML), res.ok=true,
-  // и клиент думает что операция прошла успешно — данные не меняются.
-  if (req.path.startsWith('/api/')) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  res.redirect('/hr/login');
 };
 
 const authPageShell = (title, content) => `<!DOCTYPE html>
@@ -116,11 +133,12 @@ const authPageShell = (title, content) => `<!DOCTYPE html>
 <body><div class="card">${content}</div></body></html>`;
 
 // Вход
-app.get('/hr/login', (req, res) => {
+app.get('/hr/login', async (req, res) => {
   const token = req.cookies?.hr_session;
-  const s = token && dbSession.get(token);
-  if (s && Date.now() < s.expires_at) return res.redirect('/hr');
-  const noUsers = db.prepare('SELECT COUNT(*) as cnt FROM hr_users').get().cnt === 0;
+  const s = token ? await dbSession.get(token) : null;
+  if (s && Date.now() < Number(s.expires_at)) return res.redirect('/hr');
+  const { rows } = await pool.query('SELECT COUNT(*) AS cnt FROM hr_users');
+  const noUsers = parseInt(rows[0].cnt) === 0;
   res.send(authPageShell('Вход', `
     <div class="logo">HR Dashboard</div>
     <h1>Вход</h1>
@@ -138,10 +156,11 @@ app.get('/hr/login', (req, res) => {
 
 app.post('/hr/login', loginLimiter, async (req, res) => {
   const { username, password } = req.body;
-  const user = db.prepare('SELECT password_hash FROM hr_users WHERE username = ?').get(username?.trim());
+  const { rows } = await pool.query('SELECT password_hash FROM hr_users WHERE username = $1', [username?.trim()]);
+  const user = rows[0];
   if (user && await verifyPassword(password, user.password_hash)) {
     const token = crypto.randomBytes(32).toString('hex');
-    dbSession.set(token, Date.now() + SESSION_TTL, username?.trim());
+    await dbSession.set(token, Date.now() + SESSION_TTL, username?.trim());
     res.cookie('hr_session', token, { httpOnly: true, sameSite: 'strict', maxAge: SESSION_TTL });
     return res.redirect('/hr');
   }
@@ -161,22 +180,22 @@ app.post('/hr/login', loginLimiter, async (req, res) => {
   `));
 });
 
-// Регистрация — доступна только при отсутствии пользователей ИЛИ авторизованному HR
-const isLoggedIn = (req) => {
+const isLoggedIn = async (req) => {
   const token = req.cookies?.hr_session;
   if (!token) return false;
-  const s = dbSession.get(token);
-  return s && Date.now() < s.expires_at;
+  const s = await dbSession.get(token);
+  return !!(s && Date.now() < Number(s.expires_at));
 };
 
-const canRegister = (req) => {
-  if (isLoggedIn(req)) return true;
-  return db.prepare('SELECT COUNT(*) as cnt FROM hr_users').get().cnt === 0;
+const canRegister = async (req) => {
+  if (await isLoggedIn(req)) return true;
+  const { rows } = await pool.query('SELECT COUNT(*) AS cnt FROM hr_users');
+  return parseInt(rows[0].cnt) === 0;
 };
 
-app.get('/hr/register', (req, res) => {
-  if (!canRegister(req)) return res.redirect('/hr/login');
-  const loggedIn = isLoggedIn(req);
+app.get('/hr/register', async (req, res) => {
+  if (!await canRegister(req)) return res.redirect('/hr/login');
+  const loggedIn = await isLoggedIn(req);
   res.send(authPageShell('Регистрация', `
     <div class="logo">HR Dashboard</div>
     <h1>${loggedIn ? 'Добавить пользователя' : 'Регистрация'}</h1>
@@ -196,11 +215,11 @@ app.get('/hr/register', (req, res) => {
 });
 
 app.post('/hr/register', async (req, res) => {
-  if (!canRegister(req)) return res.status(403).redirect('/hr/login');
+  if (!await canRegister(req)) return res.status(403).redirect('/hr/login');
 
   const { username, password, password2 } = req.body;
   const name = username?.trim();
-  const loggedIn = isLoggedIn(req);
+  const loggedIn = await isLoggedIn(req);
 
   const fail = (msg) => res.status(400).send(authPageShell('Регистрация', `
     <div class="logo">HR Dashboard</div>
@@ -224,28 +243,22 @@ app.post('/hr/register', async (req, res) => {
   if (!password || password.length < 6) return fail('Пароль должен содержать минимум 6 символов');
   if (password !== password2) return fail('Пароли не совпадают');
 
-  const exists = db.prepare('SELECT id FROM hr_users WHERE username = ?').get(name);
-  if (exists) return fail('Пользователь с таким логином уже существует');
+  const { rows } = await pool.query('SELECT id FROM hr_users WHERE username = $1', [name]);
+  if (rows[0]) return fail('Пользователь с таким логином уже существует');
 
-  db.prepare('INSERT INTO hr_users (username, password_hash) VALUES (?, ?)')
-    .run(name, await hashPassword(password));
+  await pool.query('INSERT INTO hr_users (username, password_hash) VALUES ($1, $2)', [name, await hashPassword(password)]);
 
-  if (loggedIn) {
-    // Уже авторизованный HR добавляет нового пользователя — остаётся в своей сессии
-    return res.redirect('/hr/account');
-  }
+  if (loggedIn) return res.redirect('/hr/account');
 
-  // Первый пользователь — автоматически логиним
   const token = crypto.randomBytes(32).toString('hex');
-  dbSession.set(token, Date.now() + SESSION_TTL, name);
+  await dbSession.set(token, Date.now() + SESSION_TTL, name);
   res.cookie('hr_session', token, { httpOnly: true, sameSite: 'strict', maxAge: SESSION_TTL });
   res.redirect('/hr');
 });
 
-// Выход
-app.get('/hr/logout', (req, res) => {
+app.get('/hr/logout', async (req, res) => {
   const token = req.cookies?.hr_session;
-  if (token) dbSession.del(token);
+  if (token) await dbSession.del(token);
   res.clearCookie('hr_session');
   res.redirect('/hr/login');
 });
@@ -317,57 +330,56 @@ async function deleteUser(id, name) {
 </script>
 </body></html>`;
 
-app.get('/hr/account', requireAuth, (req, res) => {
+const buildUsersTable = (allUsers, currentUsername) => allUsers.map(u => {
+  const isMe = u.username === currentUsername;
+  return '<tr id="urow-' + u.id + '">' +
+    '<td>' + esc(u.username) + (isMe ? '<span class="you-badge">вы</span>' : '') + '</td>' +
+    '<td style="color:#64748b;font-size:.8rem">' + (u.created_at ? new Date(u.created_at).toLocaleDateString('ru-RU') : '—') + '</td>' +
+    '<td>' + (!isMe ? '<button class="btn btn-danger btn-sm" data-uid="' + u.id + '" onclick="deleteUser(' + u.id + ', \'' + esc(u.username) + '\')">Удалить</button>' : '') + '</td>' +
+    '</tr>';
+}).join('');
+
+const accountContent = (username, userRows) => `
+  <div class="section">
+    <h2>Сменить логин</h2>
+    <form method="POST" action="/hr/account/username">
+      <label>Новый логин</label>
+      <input type="text" name="new_username" value="${esc(username)}" required minlength="3" maxlength="50"/>
+      <label>Текущий пароль</label>
+      <input type="password" name="password" required/>
+      <button class="btn" type="submit">Сохранить логин</button>
+    </form>
+  </div>
+  <div class="section">
+    <h2>Сменить пароль</h2>
+    <form method="POST" action="/hr/account/password">
+      <label>Текущий пароль</label>
+      <input type="password" name="old_password" required/>
+      <label>Новый пароль</label>
+      <input type="password" name="new_password" required minlength="6"/>
+      <label>Повторите новый пароль</label>
+      <input type="password" name="new_password2" required minlength="6"/>
+      <button class="btn" type="submit">Сменить пароль</button>
+    </form>
+  </div>
+  <div class="section">
+    <h2>Пользователи</h2>
+    <table>
+      <thead><tr><th>Логин</th><th>Создан</th><th></th></tr></thead>
+      <tbody>${userRows}</tbody>
+    </table>
+    <a href="/hr/register" style="display:inline-block;margin-top:1rem;font-size:.875rem;color:#2563eb;font-weight:500">+ Добавить пользователя</a>
+  </div>
+  <div class="section">
+    <h2>Резервная копия</h2>
+    <p style="font-size:.85rem;color:#64748b;margin-bottom:1rem">Скачать все данные в формате JSON.</p>
+    <a href="/hr/backup" class="btn" style="display:inline-block;text-decoration:none;background:#0f172a">↓ Скачать бэкап (JSON)</a>
+  </div>`;
+
+app.get('/hr/account', requireAuth, async (req, res) => {
   const username = req.hrUser?.username || '?';
-  const allUsers = db.prepare('SELECT id, username, created_at FROM hr_users ORDER BY created_at').all();
-
-  const userRows = allUsers.map(u => {
-    const isMe = u.username === username;
-    return '<tr id="urow-' + u.id + '">' +
-      '<td>' + esc(u.username) + (isMe ? '<span class="you-badge">вы</span>' : '') + '</td>' +
-      '<td style="color:#64748b;font-size:.8rem">' + (u.created_at || '—') + '</td>' +
-      '<td>' + (!isMe ? '<button class="btn btn-danger btn-sm" data-uid="' + u.id + '" onclick="deleteUser(' + u.id + ', \'' + esc(u.username) + '\')">Удалить</button>' : '') + '</td>' +
-      '</tr>';
-  }).join('');
-
-  const content = `
-    <div class="section">
-      <h2>Сменить логин</h2>
-      <form method="POST" action="/hr/account/username">
-        <label>Новый логин</label>
-        <input type="text" name="new_username" value="${esc(username)}" required minlength="3" maxlength="50"/>
-        <label>Текущий пароль</label>
-        <input type="password" name="password" required/>
-        <button class="btn" type="submit">Сохранить логин</button>
-      </form>
-    </div>
-    <div class="section">
-      <h2>Сменить пароль</h2>
-      <form method="POST" action="/hr/account/password">
-        <label>Текущий пароль</label>
-        <input type="password" name="old_password" required/>
-        <label>Новый пароль</label>
-        <input type="password" name="new_password" required minlength="6"/>
-        <label>Повторите новый пароль</label>
-        <input type="password" name="new_password2" required minlength="6"/>
-        <button class="btn" type="submit">Сменить пароль</button>
-      </form>
-    </div>
-    <div class="section">
-      <h2>Пользователи</h2>
-      <table>
-        <thead><tr><th>Логин</th><th>Создан</th><th></th></tr></thead>
-        <tbody>${userRows}</tbody>
-      </table>
-      <a href="/hr/register" style="display:inline-block;margin-top:1rem;font-size:.875rem;color:#2563eb;font-weight:500">+ Добавить пользователя</a>
-    </div>
-    <div class="section">
-      <h2>База данных</h2>
-      <p style="font-size:.85rem;color:#64748b;margin-bottom:1rem">Скачать полный дамп базы данных SQLite для резервного копирования.</p>
-      <a href="/hr/backup" class="btn" style="display:inline-block;text-decoration:none;background:#0f172a">↓ Скачать бэкап БД</a>
-    </div>`;
-
-  res.send(accountShell(username, content, null));
+  const { rows: allUsers } = await pool.query('SELECT id, username, created_at FROM hr_users ORDER BY created_at');
+  res.send(accountShell(username, accountContent(username, buildUsersTable(allUsers, username)), null));
 });
 
 app.post('/hr/account/username', requireAuth, async (req, res) => {
@@ -376,65 +388,25 @@ app.post('/hr/account/username', requireAuth, async (req, res) => {
   const { new_username, password } = req.body;
   const newName = new_username?.trim();
 
-  const flash = (ok, err) => {
-    const allUsers = db.prepare('SELECT id, username, created_at FROM hr_users ORDER BY created_at').all();
-    const username = ok ? newName : currentUsername;
-    const userRows = allUsers.map(u => {
-      const isMe = u.username === username;
-      return '<tr id="urow-' + u.id + '">' +
-        '<td>' + esc(u.username) + (isMe ? '<span class="you-badge">вы</span>' : '') + '</td>' +
-        '<td style="color:#64748b;font-size:.8rem">' + (u.created_at || '—') + '</td>' +
-        '<td>' + (!isMe ? '<button class="btn btn-danger btn-sm" data-uid="' + u.id + '" onclick="deleteUser(' + u.id + ', \'' + esc(u.username) + '\')">Удалить</button>' : '') + '</td>' +
-        '</tr>';
-    }).join('');
-    const content = `
-      <div class="section">
-        <h2>Сменить логин</h2>
-        <form method="POST" action="/hr/account/username">
-          <label>Новый логин</label>
-          <input type="text" name="new_username" value="${esc(username)}" required minlength="3" maxlength="50"/>
-          <label>Текущий пароль</label>
-          <input type="password" name="password" required/>
-          <button class="btn" type="submit">Сохранить логин</button>
-        </form>
-      </div>
-      <div class="section">
-        <h2>Сменить пароль</h2>
-        <form method="POST" action="/hr/account/password">
-          <label>Текущий пароль</label>
-          <input type="password" name="old_password" required/>
-          <label>Новый пароль</label>
-          <input type="password" name="new_password" required minlength="6"/>
-          <label>Повторите новый пароль</label>
-          <input type="password" name="new_password2" required minlength="6"/>
-          <button class="btn" type="submit">Сменить пароль</button>
-        </form>
-      </div>
-      <div class="section">
-        <h2>Пользователи</h2>
-        <table>
-          <thead><tr><th>Логин</th><th>Создан</th><th></th></tr></thead>
-          <tbody>${userRows}</tbody>
-        </table>
-        <a href="/hr/register" style="display:inline-block;margin-top:1rem;font-size:.875rem;color:#2563eb;font-weight:500">+ Добавить пользователя</a>
-      </div>`;
-    res.send(accountShell(username, content, ok ? { ok } : { err }));
+  const sendPage = async (ok, err) => {
+    const { rows: allUsers } = await pool.query('SELECT id, username, created_at FROM hr_users ORDER BY created_at');
+    const displayName = ok ? newName : currentUsername;
+    res.send(accountShell(displayName, accountContent(displayName, buildUsersTable(allUsers, displayName)), ok ? { ok } : { err }));
   };
 
-  if (!newName || newName.length < 3) return flash(null, 'Логин должен содержать минимум 3 символа');
+  if (!newName || newName.length < 3) return sendPage(null, 'Логин должен содержать минимум 3 символа');
 
-  const user = db.prepare('SELECT password_hash FROM hr_users WHERE username = ?').get(currentUsername);
-  if (!user || !await verifyPassword(password, user.password_hash)) return flash(null, 'Неверный пароль');
+  const { rows: userRows } = await pool.query('SELECT password_hash FROM hr_users WHERE username = $1', [currentUsername]);
+  if (!userRows[0] || !await verifyPassword(password, userRows[0].password_hash)) return sendPage(null, 'Неверный пароль');
 
   if (newName !== currentUsername) {
-    const exists = db.prepare('SELECT id FROM hr_users WHERE username = ?').get(newName);
-    if (exists) return flash(null, 'Пользователь с таким логином уже существует');
-    db.prepare('UPDATE hr_users SET username = ? WHERE username = ?').run(newName, currentUsername);
-    // Обновляем имя в текущей сессии
+    const { rows: existing } = await pool.query('SELECT id FROM hr_users WHERE username = $1', [newName]);
+    if (existing[0]) return sendPage(null, 'Пользователь с таким логином уже существует');
+    await pool.query('UPDATE hr_users SET username = $1 WHERE username = $2', [newName, currentUsername]);
     const token = req.cookies?.hr_session;
-    if (token) db.prepare('UPDATE hr_sessions SET username = ? WHERE token = ?').run(newName, token);
+    if (token) await pool.query('UPDATE hr_sessions SET username = $1 WHERE token = $2', [newName, token]);
   }
-  flash('Логин успешно изменён', null);
+  return sendPage('Логин успешно изменён', null);
 });
 
 app.post('/hr/account/password', requireAuth, async (req, res) => {
@@ -442,212 +414,217 @@ app.post('/hr/account/password', requireAuth, async (req, res) => {
   if (!currentUsername) return res.redirect('/hr/login');
   const { old_password, new_password, new_password2 } = req.body;
 
-  const sendPage = (ok, err) => {
-    const allUsers = db.prepare('SELECT id, username, created_at FROM hr_users ORDER BY created_at').all();
-    const userRows = allUsers.map(u => {
-      const isMe = u.username === currentUsername;
-      return '<tr id="urow-' + u.id + '">' +
-        '<td>' + esc(u.username) + (isMe ? '<span class="you-badge">вы</span>' : '') + '</td>' +
-        '<td style="color:#64748b;font-size:.8rem">' + (u.created_at || '—') + '</td>' +
-        '<td>' + (!isMe ? '<button class="btn btn-danger btn-sm" data-uid="' + u.id + '" onclick="deleteUser(' + u.id + ', \'' + esc(u.username) + '\')">Удалить</button>' : '') + '</td>' +
-        '</tr>';
-    }).join('');
-    const content = `
-      <div class="section">
-        <h2>Сменить логин</h2>
-        <form method="POST" action="/hr/account/username">
-          <label>Новый логин</label>
-          <input type="text" name="new_username" value="${esc(currentUsername)}" required minlength="3" maxlength="50"/>
-          <label>Текущий пароль</label>
-          <input type="password" name="password" required/>
-          <button class="btn" type="submit">Сохранить логин</button>
-        </form>
-      </div>
-      <div class="section">
-        <h2>Сменить пароль</h2>
-        <form method="POST" action="/hr/account/password">
-          <label>Текущий пароль</label>
-          <input type="password" name="old_password" required/>
-          <label>Новый пароль</label>
-          <input type="password" name="new_password" required minlength="6"/>
-          <label>Повторите новый пароль</label>
-          <input type="password" name="new_password2" required minlength="6"/>
-          <button class="btn" type="submit">Сменить пароль</button>
-        </form>
-      </div>
-      <div class="section">
-        <h2>Пользователи</h2>
-        <table>
-          <thead><tr><th>Логин</th><th>Создан</th><th></th></tr></thead>
-          <tbody>${userRows}</tbody>
-        </table>
-        <a href="/hr/register" style="display:inline-block;margin-top:1rem;font-size:.875rem;color:#2563eb;font-weight:500">+ Добавить пользователя</a>
-      </div>`;
-    res.send(accountShell(currentUsername, content, ok ? { ok } : { err }));
+  const sendPage = async (ok, err) => {
+    const { rows: allUsers } = await pool.query('SELECT id, username, created_at FROM hr_users ORDER BY created_at');
+    res.send(accountShell(currentUsername, accountContent(currentUsername, buildUsersTable(allUsers, currentUsername)), ok ? { ok } : { err }));
   };
 
-  const user = db.prepare('SELECT password_hash FROM hr_users WHERE username = ?').get(currentUsername);
-  if (!user || !await verifyPassword(old_password, user.password_hash)) return sendPage(null, 'Неверный текущий пароль');
+  const { rows } = await pool.query('SELECT password_hash FROM hr_users WHERE username = $1', [currentUsername]);
+  if (!rows[0] || !await verifyPassword(old_password, rows[0].password_hash)) return sendPage(null, 'Неверный текущий пароль');
   if (!new_password || new_password.length < 6) return sendPage(null, 'Новый пароль должен содержать минимум 6 символов');
   if (new_password !== new_password2) return sendPage(null, 'Пароли не совпадают');
 
-  db.prepare('UPDATE hr_users SET password_hash = ? WHERE username = ?').run(await hashPassword(new_password), currentUsername);
-  sendPage('Пароль успешно изменён', null);
+  await pool.query('UPDATE hr_users SET password_hash = $1 WHERE username = $2', [await hashPassword(new_password), currentUsername]);
+  return sendPage('Пароль успешно изменён', null);
 });
 
-app.delete('/api/hr/users/:id', requireAuth, (req, res) => {
+app.delete('/api/hr/users/:id', requireAuth, async (req, res) => {
   const currentUsername = req.hrUser?.username;
-  const target = db.prepare('SELECT id, username FROM hr_users WHERE id = ?').get(req.params.id);
+  const { rows } = await pool.query('SELECT id, username FROM hr_users WHERE id = $1', [req.params.id]);
+  const target = rows[0];
   if (!target) return res.status(404).json({ error: 'User not found' });
   if (target.username === currentUsername) return res.status(400).json({ error: 'Cannot delete yourself' });
-  db.prepare('DELETE FROM hr_sessions WHERE username = ?').run(target.username);
-  db.prepare('DELETE FROM hr_users WHERE id = ?').run(target.id);
+  await pool.query('DELETE FROM hr_sessions WHERE username = $1', [target.username]);
+  await pool.query('DELETE FROM hr_users WHERE id = $1', [target.id]);
   res.json({ ok: true });
 });
 
 // ─── Вопросы ────────────────────────────────────────────────────────────────
 
-app.get('/api/questions', (req, res) => {
-  const soft = db.prepare("SELECT text, time_limit FROM questions WHERE block='soft' ORDER BY order_index").all();
-  const hard = db.prepare("SELECT text, time_limit FROM questions WHERE block='hard' ORDER BY order_index").all();
+app.get('/api/questions', async (req, res) => {
+  const { rows: soft } = await pool.query("SELECT text, time_limit FROM questions WHERE block='soft' ORDER BY order_index");
+  const { rows: hard } = await pool.query("SELECT text, time_limit FROM questions WHERE block='hard' ORDER BY order_index");
   res.json({
-    soft: { timeLimit: soft[0]?.time_limit ?? 60, questions: soft.map(q => q.text) },
-    hard: { timeLimit: hard[0]?.time_limit ?? 60, questions: hard.map(q => q.text) },
+    soft: { timeLimit: soft[0]?.time_limit ?? 120, questions: soft.map(q => q.text) },
+    hard: { timeLimit: hard[0]?.time_limit ?? 120, questions: hard.map(q => q.text) },
   });
 });
 
-app.put('/api/questions', requireAuth, (req, res) => {
+app.put('/api/questions', requireAuth, async (req, res) => {
   const { soft, hard } = req.body;
   if (!soft?.questions?.length || !hard?.questions?.length) {
     return res.status(400).json({ error: 'Both blocks required' });
   }
-  const del = db.prepare('DELETE FROM questions');
-  const ins = db.prepare('INSERT INTO questions (block, order_index, text, time_limit) VALUES (?, ?, ?, ?)');
-  db.transaction(() => {
-    del.run();
-    soft.questions.forEach((t, i) => ins.run('soft', i, t.trim(), Math.max(10, parseInt(soft.timeLimit) || 60)));
-    hard.questions.forEach((t, i) => ins.run('hard', i, t.trim(), Math.max(10, parseInt(hard.timeLimit) || 60)));
-  })();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM questions');
+    for (let i = 0; i < soft.questions.length; i++) {
+      await client.query('INSERT INTO questions (block, order_index, text, time_limit) VALUES ($1,$2,$3,$4)',
+        ['soft', i, soft.questions[i].trim(), Math.max(10, parseInt(soft.timeLimit) || 120)]);
+    }
+    for (let i = 0; i < hard.questions.length; i++) {
+      await client.query('INSERT INTO questions (block, order_index, text, time_limit) VALUES ($1,$2,$3,$4)',
+        ['hard', i, hard.questions[i].trim(), Math.max(10, parseInt(hard.timeLimit) || 120)]);
+    }
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
   res.json({ ok: true });
 });
 
 // ─── Сессии ──────────────────────────────────────────────────────────────────
 
-app.post('/api/sessions', (req, res) => {
+app.post('/api/sessions', async (req, res) => {
   const { candidateName } = req.body;
   if (!candidateName?.trim()) return res.status(400).json({ error: 'candidateName is required' });
-  const existing = db.prepare('SELECT id FROM sessions WHERE LOWER(candidate_name) = LOWER(?)').get(candidateName.trim());
-  if (existing) return res.status(409).json({ error: 'already_exists' });
+  const { rows } = await pool.query('SELECT id FROM sessions WHERE LOWER(candidate_name) = LOWER($1)', [candidateName.trim()]);
+  if (rows[0]) return res.status(409).json({ error: 'already_exists' });
   const id = uuidv4();
-  db.prepare('INSERT INTO sessions (id, candidate_name) VALUES (?, ?)').run(id, candidateName.trim());
+  await pool.query('INSERT INTO sessions (id, candidate_name) VALUES ($1, $2)', [id, candidateName.trim()]);
   res.json({ sessionId: id });
 });
 
-app.post('/api/sessions/:id/complete', (req, res) => {
-  db.prepare('UPDATE sessions SET completed_at = CURRENT_TIMESTAMP WHERE id = ?').run(req.params.id);
+app.post('/api/sessions/:id/complete', async (req, res) => {
+  await pool.query('UPDATE sessions SET completed_at = NOW() WHERE id = $1', [req.params.id]);
   res.json({ ok: true });
 });
 
-app.post('/api/sessions/:id/archive', requireAuth, (req, res) => {
-  const session = db.prepare('SELECT id FROM sessions WHERE id = ?').get(req.params.id);
-  if (!session) return res.status(404).json({ error: 'Session not found' });
-  db.prepare('UPDATE sessions SET archived = 1 WHERE id = ?').run(req.params.id);
+app.post('/api/sessions/:id/archive', requireAuth, async (req, res) => {
+  const { rows } = await pool.query('SELECT id FROM sessions WHERE id = $1', [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: 'Session not found' });
+  await pool.query('UPDATE sessions SET archived = TRUE WHERE id = $1', [req.params.id]);
   res.json({ ok: true });
 });
 
-app.post('/api/sessions/:id/unarchive', requireAuth, (req, res) => {
-  const session = db.prepare('SELECT id FROM sessions WHERE id = ?').get(req.params.id);
-  if (!session) return res.status(404).json({ error: 'Session not found' });
-  db.prepare('UPDATE sessions SET archived = 0 WHERE id = ?').run(req.params.id);
+app.post('/api/sessions/:id/unarchive', requireAuth, async (req, res) => {
+  const { rows } = await pool.query('SELECT id FROM sessions WHERE id = $1', [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: 'Session not found' });
+  await pool.query('UPDATE sessions SET archived = FALSE WHERE id = $1', [req.params.id]);
   res.json({ ok: true });
 });
 
-app.put('/api/sessions/:id/notes', requireAuth, (req, res) => {
+app.put('/api/sessions/:id/notes', requireAuth, async (req, res) => {
   const { notes } = req.body;
-  const session = db.prepare('SELECT id FROM sessions WHERE id = ?').get(req.params.id);
-  if (!session) return res.status(404).json({ error: 'Session not found' });
-  db.prepare('UPDATE sessions SET notes = ? WHERE id = ?').run(notes || null, req.params.id);
+  const { rows } = await pool.query('SELECT id FROM sessions WHERE id = $1', [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: 'Session not found' });
+  await pool.query('UPDATE sessions SET notes = $1 WHERE id = $2', [notes || null, req.params.id]);
   res.json({ ok: true });
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
-app.get('/hr/backup', requireAuth, (req, res) => {
-  const dbPath = process.env.DB_PATH || path.join(__dirname, 'assessments.db');
-  const filename = 'hr_backup_' + new Date().toISOString().slice(0, 10) + '.db';
-  res.download(dbPath, filename, (err) => {
-    if (err && !res.headersSent) res.status(500).send('Ошибка при скачивании');
-  });
+app.get('/hr/backup', requireAuth, async (req, res) => {
+  const [sessRes, ansRes, qRes] = await Promise.all([
+    pool.query('SELECT * FROM sessions ORDER BY created_at'),
+    pool.query('SELECT * FROM answers ORDER BY session_id, block, question_index'),
+    pool.query('SELECT * FROM questions ORDER BY block, order_index'),
+  ]);
+  const data = {
+    exported_at: new Date().toISOString(),
+    sessions: sessRes.rows,
+    answers: ansRes.rows,
+    questions: qRes.rows,
+  };
+  const filename = 'hr_backup_' + new Date().toISOString().slice(0, 10) + '.json';
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Content-Disposition', "attachment; filename*=UTF-8''" + encodeURIComponent(filename));
+  res.send(JSON.stringify(data, null, 2));
 });
 
-app.get('/api/sessions/archived', requireAuth, (req, res) => {
-  const sessions = db.prepare('SELECT id, candidate_name, created_at, completed_at, notes FROM sessions WHERE archived = 1 ORDER BY created_at DESC').all();
-  res.json(sessions);
+app.get('/api/sessions/archived', requireAuth, async (req, res) => {
+  const { rows } = await pool.query('SELECT id, candidate_name, created_at, completed_at, notes FROM sessions WHERE archived = TRUE ORDER BY created_at DESC');
+  res.json(rows);
 });
 
-app.get('/api/sessions', requireAuth, (req, res) => {
-  const sessions = db.prepare('SELECT id, candidate_name, created_at, completed_at, notes FROM sessions WHERE archived = 0 ORDER BY created_at DESC').all();
-  res.json(sessions);
+app.get('/api/sessions', requireAuth, async (req, res) => {
+  const { rows } = await pool.query('SELECT id, candidate_name, created_at, completed_at, notes FROM sessions WHERE archived = FALSE ORDER BY created_at DESC');
+  res.json(rows);
 });
 
 // ─── Попытки вставки ─────────────────────────────────────────────────────────
 
-app.post('/api/paste-attempts', (req, res) => {
+app.post('/api/paste-attempts', async (req, res) => {
   const { sessionId, block, questionIndex } = req.body;
   if (!sessionId || !block || questionIndex === undefined) {
     return res.status(400).json({ error: 'sessionId, block, questionIndex are required' });
   }
-  db.prepare('INSERT INTO paste_attempts (session_id, block, question_index) VALUES (?, ?, ?)')
-    .run(sessionId, block, questionIndex);
+  await pool.query('INSERT INTO paste_attempts (session_id, block, question_index) VALUES ($1, $2, $3)', [sessionId, block, questionIndex]);
   res.json({ ok: true });
 });
 
 // ─── Ответы ───────────────────────────────────────────────────────────────────
 
-app.post('/api/answers', (req, res) => {
+app.post('/api/answers', async (req, res) => {
   const { sessionId, block, questionIndex, questionText, answerText, timeSpent, autoSubmitted } = req.body;
   if (!sessionId || !block || questionIndex === undefined) {
     return res.status(400).json({ error: 'sessionId, block, questionIndex are required' });
   }
-  const session = db.prepare('SELECT id, completed_at FROM sessions WHERE id = ?').get(sessionId);
-  if (!session) return res.status(404).json({ error: 'Session not found' });
-  db.prepare(`
-    INSERT OR REPLACE INTO answers (session_id, block, question_index, question_text, answer_text, time_spent, auto_submitted)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(sessionId, block, questionIndex, questionText, answerText || null, timeSpent || 0, autoSubmitted ? 1 : 0);
+  const { rows } = await pool.query('SELECT id FROM sessions WHERE id = $1', [sessionId]);
+  if (!rows[0]) return res.status(404).json({ error: 'Session not found' });
+  await pool.query(`
+    INSERT INTO answers (session_id, block, question_index, question_text, answer_text, time_spent, auto_submitted)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    ON CONFLICT (session_id, block, question_index) DO UPDATE SET
+      question_text = EXCLUDED.question_text,
+      answer_text = EXCLUDED.answer_text,
+      time_spent = EXCLUDED.time_spent,
+      auto_submitted = EXCLUDED.auto_submitted
+  `, [sessionId, block, questionIndex, questionText, answerText || null, timeSpent || 0, !!autoSubmitted]);
   res.json({ ok: true });
 });
 
-app.delete('/api/sessions/:id', requireAuth, (req, res) => {
-  const session = db.prepare('SELECT id FROM sessions WHERE id = ?').get(req.params.id);
-  if (!session) return res.status(404).json({ error: 'Session not found' });
-  db.transaction(() => {
-    db.prepare('DELETE FROM paste_attempts WHERE session_id = ?').run(req.params.id);
-    db.prepare('DELETE FROM answers WHERE session_id = ?').run(req.params.id);
-    db.prepare('DELETE FROM sessions WHERE id = ?').run(req.params.id);
-  })();
+app.delete('/api/sessions/:id', requireAuth, async (req, res) => {
+  const { rows } = await pool.query('SELECT id FROM sessions WHERE id = $1', [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: 'Session not found' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM paste_attempts WHERE session_id = $1', [req.params.id]);
+    await client.query('DELETE FROM answers WHERE session_id = $1', [req.params.id]);
+    await client.query('DELETE FROM sessions WHERE id = $1', [req.params.id]);
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
   res.json({ ok: true });
 });
 
-app.get('/api/sessions/:id/results', requireAuth, (req, res) => {
-  const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(req.params.id);
-  if (!session) return res.status(404).json({ error: 'Session not found' });
-  const answers = db.prepare('SELECT * FROM answers WHERE session_id = ? ORDER BY block, question_index').all(req.params.id);
-  res.json({ session, answers });
+app.get('/api/sessions/:id/results', requireAuth, async (req, res) => {
+  const { rows: sRows } = await pool.query('SELECT * FROM sessions WHERE id = $1', [req.params.id]);
+  if (!sRows[0]) return res.status(404).json({ error: 'Session not found' });
+  const { rows: answers } = await pool.query('SELECT * FROM answers WHERE session_id = $1 ORDER BY block, question_index', [req.params.id]);
+  res.json({ session: sRows[0], answers });
 });
 
 // ─── HR: результаты кандидата ─────────────────────────────────────────────────
 
-app.get('/results/:id', requireAuth, (req, res) => {
-  const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(req.params.id);
-  if (!session) return res.status(404).send('<h1>Сессия не найдена</h1>');
-  const answers = db.prepare('SELECT * FROM answers WHERE session_id = ? ORDER BY block, question_index').all(req.params.id);
-  const pastes  = db.prepare('SELECT block, question_index FROM paste_attempts WHERE session_id = ?').all(req.params.id);
+app.get('/results/:id', requireAuth, async (req, res) => {
+  const { rows: sRows } = await pool.query('SELECT * FROM sessions WHERE id = $1', [req.params.id]);
+  if (!sRows[0]) return res.status(404).send('<h1>Сессия не найдена</h1>');
+  const session = sRows[0];
+
+  const [ansRes, pasteRes, softTLRes, hardTLRes] = await Promise.all([
+    pool.query('SELECT * FROM answers WHERE session_id = $1 ORDER BY block, question_index', [req.params.id]),
+    pool.query('SELECT block, question_index FROM paste_attempts WHERE session_id = $1', [req.params.id]),
+    pool.query("SELECT time_limit FROM questions WHERE block='soft' LIMIT 1"),
+    pool.query("SELECT time_limit FROM questions WHERE block='hard' LIMIT 1"),
+  ]);
+
+  const answers = ansRes.rows;
+  const pastes  = pasteRes.rows;
+  const softTL  = softTLRes.rows[0]?.time_limit ?? 120;
+  const hardTL  = hardTLRes.rows[0]?.time_limit ?? 120;
 
   const softAnswers = answers.filter(a => a.block === 'soft');
   const hardAnswers = answers.filter(a => a.block === 'hard');
-  const softTL = db.prepare("SELECT time_limit FROM questions WHERE block='soft' LIMIT 1").get()?.time_limit ?? 60;
-  const hardTL = db.prepare("SELECT time_limit FROM questions WHERE block='hard' LIMIT 1").get()?.time_limit ?? 60;
 
   const pasteCount = (block, qi) => pastes.filter(p => p.block === block && p.question_index === qi).length;
 
@@ -742,8 +719,8 @@ app.get('/results/:id', requireAuth, (req, res) => {
   <div class="page-header">
     <div class="candidate-name">${esc(session.candidate_name)}</div>
     <div class="session-meta">
-      <span>Начало: <span class="local-date" data-ts="${session.created_at}"></span></span>
-      <span>${session.completed_at ? 'Завершено: <span class="local-date" data-ts="' + session.completed_at + '"></span>' : 'Не завершено'}</span>
+      <span>Начало: <span class="local-date" data-ts="${toISO(session.created_at)}"></span></span>
+      <span>${session.completed_at ? 'Завершено: <span class="local-date" data-ts="' + toISO(session.completed_at) + '"></span>' : 'Не завершено'}</span>
     </div>
   </div>
   <div class="summary">
@@ -786,7 +763,7 @@ app.get('/results/:id', requireAuth, (req, res) => {
   </div>
 </div>
 <script>
-document.querySelectorAll('.local-date[data-ts]').forEach(function(el){var ts=el.getAttribute('data-ts');if(!ts)return;var d=new Date(ts.replace(' ','T')+'Z');el.textContent=isNaN(d)?ts:d.toLocaleString('ru-RU');});
+document.querySelectorAll('.local-date[data-ts]').forEach(function(el){var ts=el.getAttribute('data-ts');if(!ts)return;var d=new Date(ts);el.textContent=isNaN(d)?ts:d.toLocaleString('ru-RU');});
 async function saveNotes(){
   var status=document.getElementById('notes-status');
   status.textContent='Сохранение...'; status.style.color='#64748b';
@@ -804,16 +781,24 @@ document.getElementById('hr-notes').addEventListener('blur', saveNotes);
 
 // ─── Экспорт TXT ─────────────────────────────────────────────────────────────
 
-app.get('/results/:id/export.txt', requireAuth, (req, res) => {
-  const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(req.params.id);
-  if (!session) return res.status(404).send('Session not found');
+app.get('/results/:id/export.txt', requireAuth, async (req, res) => {
+  const { rows: sRows } = await pool.query('SELECT * FROM sessions WHERE id = $1', [req.params.id]);
+  if (!sRows[0]) return res.status(404).send('Session not found');
+  const session = sRows[0];
 
-  const answers = db.prepare('SELECT * FROM answers WHERE session_id = ? ORDER BY block, question_index').all(req.params.id);
-  const pastes  = db.prepare('SELECT block, question_index FROM paste_attempts WHERE session_id = ?').all(req.params.id);
-  const softTL  = db.prepare("SELECT time_limit FROM questions WHERE block='soft' LIMIT 1").get()?.time_limit ?? 60;
-  const hardTL  = db.prepare("SELECT time_limit FROM questions WHERE block='hard' LIMIT 1").get()?.time_limit ?? 60;
-  const softAnswers = answers.filter(a => a.block === 'soft');
-  const hardAnswers = answers.filter(a => a.block === 'hard');
+  const [ansRes, pasteRes, softTLRes, hardTLRes] = await Promise.all([
+    pool.query('SELECT * FROM answers WHERE session_id = $1 ORDER BY block, question_index', [req.params.id]),
+    pool.query('SELECT block, question_index FROM paste_attempts WHERE session_id = $1', [req.params.id]),
+    pool.query("SELECT time_limit FROM questions WHERE block='soft' LIMIT 1"),
+    pool.query("SELECT time_limit FROM questions WHERE block='hard' LIMIT 1"),
+  ]);
+
+  const answers      = ansRes.rows;
+  const pastes       = pasteRes.rows;
+  const softTL       = softTLRes.rows[0]?.time_limit ?? 120;
+  const hardTL       = hardTLRes.rows[0]?.time_limit ?? 120;
+  const softAnswers  = answers.filter(a => a.block === 'soft');
+  const hardAnswers  = answers.filter(a => a.block === 'hard');
 
   const fmtTime = (sec) => {
     if (!sec && sec !== 0) return '—';
@@ -826,8 +811,8 @@ app.get('/results/:id/export.txt', requireAuth, (req, res) => {
   lines.push('РЕЗУЛЬТАТЫ ТЕСТИРОВАНИЯ');
   lines.push('='.repeat(60));
   lines.push('Кандидат: ' + session.candidate_name);
-  lines.push('Начало: ' + (session.created_at || '—'));
-  lines.push('Завершено: ' + (session.completed_at || 'нет'));
+  lines.push('Начало: ' + fmtDate(session.created_at));
+  lines.push('Завершено: ' + (session.completed_at ? fmtDate(session.completed_at) : 'нет'));
   lines.push('');
 
   const renderBlock = (items, block, timeLimit, title) => {
@@ -862,16 +847,22 @@ app.get('/results/:id/export.txt', requireAuth, (req, res) => {
 
 // ─── Экспорт для AI (JSON) ────────────────────────────────────────────────────
 
-app.get('/results/:id/export.json', requireAuth, (req, res) => {
-  const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(req.params.id);
-  if (!session) return res.status(404).json({ error: 'Session not found' });
+app.get('/results/:id/export.json', requireAuth, async (req, res) => {
+  const { rows: sRows } = await pool.query('SELECT * FROM sessions WHERE id = $1', [req.params.id]);
+  if (!sRows[0]) return res.status(404).json({ error: 'Session not found' });
+  const session = sRows[0];
 
-  const answers = db.prepare('SELECT * FROM answers WHERE session_id = ? ORDER BY block, question_index').all(req.params.id);
-  const pastes  = db.prepare('SELECT block, question_index, created_at FROM paste_attempts WHERE session_id = ? ORDER BY created_at').all(req.params.id);
+  const [ansRes, pasteRes, softTLRes, hardTLRes] = await Promise.all([
+    pool.query('SELECT * FROM answers WHERE session_id = $1 ORDER BY block, question_index', [req.params.id]),
+    pool.query('SELECT block, question_index, created_at FROM paste_attempts WHERE session_id = $1 ORDER BY created_at', [req.params.id]),
+    pool.query("SELECT time_limit FROM questions WHERE block='soft' LIMIT 1"),
+    pool.query("SELECT time_limit FROM questions WHERE block='hard' LIMIT 1"),
+  ]);
 
-  const softTL = db.prepare("SELECT time_limit FROM questions WHERE block='soft' LIMIT 1").get()?.time_limit ?? 60;
-  const hardTL = db.prepare("SELECT time_limit FROM questions WHERE block='hard' LIMIT 1").get()?.time_limit ?? 60;
-
+  const answers     = ansRes.rows;
+  const pastes      = pasteRes.rows;
+  const softTL      = softTLRes.rows[0]?.time_limit ?? 120;
+  const hardTL      = hardTLRes.rows[0]?.time_limit ?? 120;
   const softAnswers = answers.filter(a => a.block === 'soft');
   const hardAnswers = answers.filter(a => a.block === 'hard');
 
@@ -887,7 +878,7 @@ app.get('/results/:id/export.json', requireAuth, (req, res) => {
       time_used_percent: timeLimit > 0 ? Math.round((a.time_spent / timeLimit) * 100) : 0,
       transition: a.auto_submitted ? 'auto_timeout' : 'manual',
       paste_attempts: qPastes.length,
-      paste_attempt_timestamps: qPastes.map(p => p.created_at),
+      paste_attempt_timestamps: qPastes.map(p => toISO(p.created_at)),
     };
   });
 
@@ -916,8 +907,8 @@ app.get('/results/:id/export.json', requireAuth, (req, res) => {
     },
     candidate: {
       name: session.candidate_name,
-      started_at: session.created_at,
-      completed_at: session.completed_at || null,
+      started_at: toISO(session.created_at),
+      completed_at: toISO(session.completed_at) || null,
       completed: !!session.completed_at,
       duration_minutes: durationMin,
     },
@@ -939,8 +930,8 @@ app.get('/results/:id/export.json', requireAuth, (req, res) => {
 
 // ─── HR: дашборд ──────────────────────────────────────────────────────────────
 
-app.get('/hr', requireAuth, (req, res) => {
-  const sessions = db.prepare('SELECT id, candidate_name, created_at, completed_at, notes FROM sessions WHERE archived = 0 ORDER BY created_at DESC').all();
+app.get('/hr', requireAuth, async (req, res) => {
+  const { rows: sessions } = await pool.query('SELECT id, candidate_name, created_at, completed_at, notes FROM sessions WHERE archived = FALSE ORDER BY created_at DESC');
   const initialIds = JSON.stringify(sessions.map(s => s.id));
 
   const rows = sessions.length === 0
@@ -950,9 +941,9 @@ app.get('/hr', requireAuth, (req, res) => {
         const dur = done
           ? Math.round((new Date(s.completed_at) - new Date(s.created_at)) / 60000) + ' мин'
           : '—';
-        return '<tr id="row-' + s.id + '" data-name="' + esc(s.candidate_name) + '" data-date="' + (s.created_at || '') + '" data-status="' + (done ? 'done' : 'active') + '">' +
+        return '<tr id="row-' + s.id + '" data-name="' + esc(s.candidate_name) + '" data-date="' + toISO(s.created_at) + '" data-status="' + (done ? 'done' : 'active') + '">' +
           '<td><strong>' + esc(s.candidate_name) + '</strong>' + (s.notes ? ' <span class="note-badge" title="' + esc(s.notes) + '">📝</span>' : '') + '</td>' +
-          '<td><span class="local-date" data-ts="' + s.created_at + '"></span></td>' +
+          '<td><span class="local-date" data-ts="' + toISO(s.created_at) + '"></span></td>' +
           '<td>' + (done ? '<span class="status-done">Завершено</span>' : '<span class="status-prog">В процессе</span>') + '</td>' +
           '<td>' + dur + '</td>' +
           '<td><a href="/results/' + s.id + '" target="_blank" class="res-link">Результаты →</a></td>' +
@@ -978,8 +969,6 @@ app.get('/hr', requireAuth, (req, res) => {
   .main{margin-left:220px;padding:2rem}
   .tab-content{display:none}.tab-content.active{display:block}
   h1{font-size:1.35rem;font-weight:700;margin-bottom:1.5rem}
-
-  /* Кандидаты */
   .table-wrap{background:white;border-radius:14px;box-shadow:0 1px 4px rgba(0,0,0,.07);overflow:hidden}
   .table-header{display:flex;align-items:center;justify-content:space-between;padding:1rem 1.5rem;border-bottom:1px solid #f1f5f9}
   .table-header h2{font-size:1rem;font-weight:600}
@@ -1009,8 +998,6 @@ app.get('/hr', requireAuth, (req, res) => {
   .del-btn{background:none;border:1px solid #fecaca;color:#ef4444;font-size:.78rem;font-weight:600;padding:4px 10px;border-radius:6px;cursor:pointer;transition:background .15s,color .15s}
   .del-btn:hover{background:#fee2e2}
   .del-btn:disabled{opacity:.4;cursor:default}
-
-  /* Редактор вопросов */
   .editor-grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem}
   .q-block{background:white;border-radius:14px;box-shadow:0 1px 4px rgba(0,0,0,.07);overflow:hidden}
   .q-block-header{padding:1rem 1.5rem;border-bottom:1px solid #f1f5f9;display:flex;align-items:center;justify-content:space-between;gap:1rem}
@@ -1086,7 +1073,6 @@ app.get('/hr', requireAuth, (req, res) => {
     <div id="editor-loading" style="color:#64748b;font-size:.9rem">Загрузка вопросов...</div>
     <div id="editor-wrap" style="display:none">
       <div class="editor-grid">
-
         <div class="q-block">
           <div class="q-block-header">
             <span class="q-block-title title-soft">Soft Skills</span>
@@ -1100,7 +1086,6 @@ app.get('/hr', requireAuth, (req, res) => {
             <span class="q-count" id="cnt-soft"></span>
           </div>
         </div>
-
         <div class="q-block">
           <div class="q-block-header">
             <span class="q-block-title title-hard">Hard Skills</span>
@@ -1114,7 +1099,6 @@ app.get('/hr', requireAuth, (req, res) => {
             <span class="q-count" id="cnt-hard"></span>
           </div>
         </div>
-
       </div>
       <div class="save-bar">
         <button class="save-btn" id="save-btn" onclick="saveQuestions()">Сохранить изменения</button>
@@ -1153,8 +1137,6 @@ function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
-// Делегирование: имя кандидата не попадает в inline-onclick (иначе спецсимволы
-// в имени ломали бы парсинг скрипта). Данные берём из data-атрибутов.
 document.addEventListener('click', function(e) {
   var btn = e.target.closest('.del-btn');
   if (btn) { deleteSession(btn.getAttribute('data-sid'), btn.getAttribute('data-name')); return; }
@@ -1232,8 +1214,6 @@ async function unarchiveSession(id, name) {
   }
 }
 
-// ─── Поиск и сортировка кандидатов ─────────────────────────────────────────
-
 function filterCandidates(query) {
   var q = query.toLowerCase().trim();
   var rows = document.querySelectorAll('#candidates-tbody tr[data-name]');
@@ -1272,8 +1252,6 @@ function sortTable(col) {
   });
   rows.forEach(function(row) { tbody.appendChild(row); });
 }
-
-// ─── Авто-уведомление о новых результатах ───────────────────────────────────
 
 async function checkNewSessions() {
   try {
@@ -1314,7 +1292,7 @@ async function loadArchive(force) {
         var dur = done ? Math.round((new Date(s.completed_at) - new Date(s.created_at)) / 60000) + ' мин' : '—';
         return '<tr id="row-' + s.id + '">' +
           '<td><strong>' + escHtml(s.candidate_name) + '</strong></td>' +
-          '<td><span class="local-date" data-ts="' + s.created_at + '"></span></td>' +
+          '<td><span class="local-date" data-ts="' + (s.created_at || '') + '"></span></td>' +
           '<td>' + (done ? '<span class="status-done">Завершено</span>' : '<span class="status-prog">В процессе</span>') + '</td>' +
           '<td>' + dur + '</td>' +
           '<td><a href="/results/' + s.id + '" target="_blank" class="res-link">Результаты →</a></td>' +
@@ -1333,7 +1311,7 @@ function formatLocalDates() {
   document.querySelectorAll('.local-date[data-ts]').forEach(function(el) {
     var ts = el.getAttribute('data-ts');
     if (!ts) return;
-    var d = new Date(ts.replace(' ', 'T') + 'Z');
+    var d = new Date(ts);
     el.textContent = isNaN(d) ? ts : d.toLocaleString('ru-RU');
   });
 }
@@ -1370,29 +1348,19 @@ function renderList(block) {
   qs.forEach(function(q, i) {
     var row = document.createElement('div');
     row.className = 'q-row';
-    row.setAttribute('data-block', block);
-    row.setAttribute('data-index', i);
-
     var num = document.createElement('span');
     num.className = 'q-num';
     num.textContent = i + 1;
-
     var ta = document.createElement('textarea');
     ta.className = 'q-textarea';
     ta.value = q;
-    ta.setAttribute('data-block', block);
-    ta.setAttribute('data-index', i);
     ta.rows = 3;
-    ta.addEventListener('input', function() {
-      questionsData[block].questions[i] = ta.value;
-    });
-
+    ta.addEventListener('input', function() { questionsData[block].questions[i] = ta.value; });
     var btn = document.createElement('button');
     btn.className = 'btn-remove';
     btn.title = 'Удалить';
     btn.innerHTML = '&times;';
     btn.addEventListener('click', function() { removeQuestion(block, i); });
-
     row.appendChild(num);
     row.appendChild(ta);
     row.appendChild(btn);
@@ -1409,10 +1377,7 @@ function addQuestion(block) {
 }
 
 function removeQuestion(block, index) {
-  if (questionsData[block].questions.length <= 1) {
-    alert('Должен быть хотя бы один вопрос');
-    return;
-  }
+  if (questionsData[block].questions.length <= 1) { alert('Должен быть хотя бы один вопрос'); return; }
   if (!confirm('Удалить вопрос ' + (index + 1) + '?')) return;
   questionsData[block].questions.splice(index, 1);
   renderList(block);
@@ -1421,25 +1386,16 @@ function removeQuestion(block, index) {
 async function saveQuestions() {
   var softQs = questionsData.soft.questions.map(function(q) { return q.trim(); }).filter(Boolean);
   var hardQs = questionsData.hard.questions.map(function(q) { return q.trim(); }).filter(Boolean);
-
-  if (!softQs.length || !hardQs.length) {
-    alert('Нельзя сохранить пустой блок вопросов');
-    return;
-  }
-
+  if (!softQs.length || !hardQs.length) { alert('Нельзя сохранить пустой блок вопросов'); return; }
   var payload = {
-    soft: { timeLimit: parseInt(document.getElementById('time-soft').value) || 60, questions: softQs },
-    hard: { timeLimit: parseInt(document.getElementById('time-hard').value) || 60, questions: hardQs }
+    soft: { timeLimit: parseInt(document.getElementById('time-soft').value) || 120, questions: softQs },
+    hard: { timeLimit: parseInt(document.getElementById('time-hard').value) || 120, questions: hardQs }
   };
-
   var btn = document.getElementById('save-btn');
   var msg = document.getElementById('save-msg');
   var err = document.getElementById('save-err');
-  btn.disabled = true;
-  btn.textContent = 'Сохранение...';
-  msg.style.display = 'none';
-  err.style.display = 'none';
-
+  btn.disabled = true; btn.textContent = 'Сохранение...';
+  msg.style.display = 'none'; err.style.display = 'none';
   try {
     var res = await fetch('/api/questions', {
       method: 'PUT',
@@ -1457,13 +1413,27 @@ async function saveQuestions() {
     err.style.display = 'inline';
     setTimeout(function() { err.style.display = 'none'; }, 3000);
   } finally {
-    btn.disabled = false;
-    btn.textContent = 'Сохранить изменения';
+    btn.disabled = false; btn.textContent = 'Сохранить изменения';
   }
 }
 </script>
 </body></html>`);
 });
 
+// ─── Глобальный обработчик ошибок ────────────────────────────────────────────
+
+app.use((err, req, res, next) => {
+  console.error(err);
+  if (!res.headersSent) {
+    if (req.path.startsWith('/api/')) {
+      res.status(500).json({ error: 'Internal server error' });
+    } else {
+      res.status(500).send('<h1>Внутренняя ошибка сервера</h1><p>' + err.message + '</p>');
+    }
+  }
+});
+
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log('Backend running on port ' + PORT));
+init()
+  .then(() => app.listen(PORT, () => console.log('Backend running on port ' + PORT)))
+  .catch(err => { console.error('DB init failed:', err); process.exit(1); });

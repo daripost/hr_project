@@ -1,10 +1,22 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: hr_db
+      POSTGRES_USER: hr_user
+      POSTGRES_PASSWORD: hr_pass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
   backend:
     build: ./backend
     expose:
       - "3001"
-    volumes:
-      - ./backend/data:/app/data
+    environment:
+      DATABASE_URL: postgres://hr_user:hr_pass@postgres:5432/hr_db
+    depends_on:
+      - postgres
     restart: unless-stopped
 
   frontend:
@@ -14,3 +26,6 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
+
+volumes:
+  postgres_data:
