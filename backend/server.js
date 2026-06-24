@@ -588,13 +588,22 @@ app.post('/hr/import-db', requireAuth, upload.single('db_file'), async (req, res
   const SQL = await initSqlJs({ locateFile: file => path.join(__dirname, 'node_modules', 'sql.js', 'dist', file) });
   const db = new SQL.Database(new Uint8Array(req.file.buffer));
 
-  const infoStmt = db.prepare('PRAGMA table_info(answers)');
-  const colNames = [];
-  while (infoStmt.step()) colNames.push(infoStmt.getAsObject().name);
-  infoStmt.free();
-  const textCol = colNames.includes('answer_text') ? 'answer_text' : 'image_data';
+  const ansInfoStmt = db.prepare('PRAGMA table_info(answers)');
+  const ansColNames = [];
+  while (ansInfoStmt.step()) ansColNames.push(ansInfoStmt.getAsObject().name);
+  ansInfoStmt.free();
+  const textCol = ansColNames.includes('answer_text') ? 'answer_text' : 'image_data';
 
-  const sessStmt = db.prepare('SELECT id, candidate_name, created_at, completed_at, notes FROM sessions WHERE completed_at IS NOT NULL');
+  const sessInfoStmt = db.prepare('PRAGMA table_info(sessions)');
+  const sessColNames = [];
+  while (sessInfoStmt.step()) sessColNames.push(sessInfoStmt.getAsObject().name);
+  sessInfoStmt.free();
+  const hasNotes = sessColNames.includes('notes');
+
+  const sessSql = hasNotes
+    ? 'SELECT id, candidate_name, created_at, completed_at, notes FROM sessions WHERE completed_at IS NOT NULL'
+    : 'SELECT id, candidate_name, created_at, completed_at FROM sessions WHERE completed_at IS NOT NULL';
+  const sessStmt = db.prepare(sessSql);
   const sessions = [];
   while (sessStmt.step()) sessions.push(sessStmt.getAsObject());
   sessStmt.free();
