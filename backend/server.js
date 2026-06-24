@@ -11,6 +11,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
 const mammoth = require('mammoth');
+const initSqlJs = require('sql.js');
 const { pool, init } = require('./db');
 
 const anthropic = new Anthropic({
@@ -580,6 +581,63 @@ app.post('/hr/vacancy', requireAuth, upload.single('vacancy_file'), async (req, 
     [text]
   );
   res.json({ ok: true, text });
+});
+
+app.post('/hr/import-db', requireAuth, upload.single('db_file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Файл не передан' });
+  const SQL = await initSqlJs();
+  const db = new SQL.Database(new Uint8Array(req.file.buffer));
+
+  const infoStmt = db.prepare('PRAGMA table_info(answers)');
+  const colNames = [];
+  while (infoStmt.step()) colNames.push(infoStmt.getAsObject().name);
+  infoStmt.free();
+  const textCol = colNames.includes('answer_text') ? 'answer_text' : 'image_data';
+
+  const sessStmt = db.prepare('SELECT id, candidate_name, created_at, completed_at, notes FROM sessions WHERE completed_at IS NOT NULL');
+  const sessions = [];
+  while (sessStmt.step()) sessions.push(sessStmt.getAsObject());
+  sessStmt.free();
+
+  let imported = 0, skipped = 0;
+  for (const session of sessions) {
+    const { rows: existing } = await pool.query(
+      'SELECT id FROM sessions WHERE id = $1 OR LOWER(candidate_name) = LOWER($2)',
+      [session.id, session.candidate_name]
+    );
+    if (existing.length) { skipped++; continue; }
+
+    const ansStmt = db.prepare(`SELECT block, question_index, question_text, ${textCol} AS answer_text, time_spent, auto_submitted FROM answers WHERE session_id = ?`);
+    ansStmt.bind([session.id]);
+    const answers = [];
+    while (ansStmt.step()) answers.push(ansStmt.getAsObject());
+    ansStmt.free();
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        'INSERT INTO sessions (id, candidate_name, created_at, completed_at, notes, archived) VALUES ($1, $2, $3, $4, $5, FALSE)',
+        [session.id, session.candidate_name, session.created_at, session.completed_at, session.notes || null]
+      );
+      for (const a of answers) {
+        await client.query(
+          'INSERT INTO answers (session_id, block, question_index, question_text, answer_text, time_spent, auto_submitted) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING',
+          [session.id, a.block, a.question_index, a.question_text, a.answer_text, a.time_spent, a.auto_submitted === 1]
+        );
+      }
+      await client.query('COMMIT');
+      imported++;
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  db.close();
+  res.json({ imported, skipped });
 });
 
 app.post('/api/sessions/:id/analyze', requireAuth, async (req, res) => {
@@ -1189,6 +1247,9 @@ app.get('/hr', requireAuth, async (req, res) => {
   <button class="nav-btn" data-tab="vacancy" onclick="switchTab('vacancy', this)">
     <span class="nav-icon">💼</span> Вакансия
   </button>
+  <button class="nav-btn" data-tab="import" onclick="switchTab('import', this)">
+    <span class="nav-icon">📥</span> Импорт
+  </button>
   <a href="/hr/account" class="nav-btn" style="text-decoration:none">
     <span class="nav-icon">⚙️</span> Аккаунт
   </a>
@@ -1294,6 +1355,23 @@ app.get('/hr', requireAuth, async (req, res) => {
         <div style="display:flex;align-items:center;gap:.75rem">
           <button onclick="uploadVacancy()" style="padding:.65rem 1.5rem;background:#2563eb;color:white;border:none;border-radius:8px;font-size:.875rem;font-weight:600;cursor:pointer">Загрузить</button>
           <span id="vacancy-status" style="font-size:.82rem"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="tab-import" class="tab-content">
+    <h1>Импорт данных</h1>
+    <div class="table-wrap" style="padding:1.5rem 2rem;max-width:800px">
+      <p style="font-size:.875rem;color:#64748b;margin-bottom:1.5rem">
+        Загрузите файл базы данных <strong>.db</strong> от предыдущей версии системы. Будут импортированы завершённые сессии с ответами. Уже существующие кандидаты (по имени или ID) будут пропущены.
+      </p>
+      <div style="display:flex;flex-direction:column;gap:.75rem">
+        <label style="font-size:.8rem;font-weight:600;color:#374151">Файл базы данных (.db)</label>
+        <input type="file" id="import-file" accept=".db" style="font-size:.875rem"/>
+        <div style="display:flex;align-items:center;gap:.75rem">
+          <button onclick="importDb()" style="padding:.65rem 1.5rem;background:#2563eb;color:white;border:none;border-radius:8px;font-size:.875rem;font-weight:600;cursor:pointer">Импортировать</button>
+          <span id="import-status" style="font-size:.82rem"></span>
         </div>
       </div>
     </div>
@@ -1554,6 +1632,26 @@ async function uploadVacancy() {
     status.textContent = 'Ошибка сети'; status.style.color = '#ef4444';
   }
   setTimeout(function() { status.textContent = ''; }, 3000);
+}
+
+async function importDb() {
+  var file = document.getElementById('import-file').files[0];
+  var status = document.getElementById('import-status');
+  if (!file) { status.textContent = 'Выберите файл'; status.style.color = '#ef4444'; return; }
+  var fd = new FormData();
+  fd.append('db_file', file);
+  status.textContent = 'Импортирую...'; status.style.color = '#64748b';
+  try {
+    var res = await fetch('/hr/import-db', { method: 'POST', body: fd, credentials: 'same-origin' });
+    var data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Ошибка сервера');
+    status.textContent = 'Импортировано: ' + data.imported + ', пропущено (дубли): ' + data.skipped;
+    status.style.color = '#10b981';
+    document.getElementById('import-file').value = '';
+  } catch(e) {
+    status.textContent = 'Ошибка: ' + e.message;
+    status.style.color = '#ef4444';
+  }
 }
 
 async function loadQuestions() {
