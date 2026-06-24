@@ -597,7 +597,9 @@ ${fmt(hardAnswers, 'Hard Skills')}
 
   let result;
   try {
-    result = JSON.parse(message.content[0].text);
+    const text = message.content[0].text;
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    result = JSON.parse(jsonMatch ? jsonMatch[0] : text);
   } catch {
     return res.status(500).json({ error: 'Не удалось разобрать ответ AI' });
   }
