@@ -8,15 +8,13 @@ const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const { v4: uuidv4 } = require('uuid');
 const Anthropic = require('@anthropic-ai/sdk');
-const { SocksProxyAgent } = require('socks-proxy-agent');
 const multer = require('multer');
 const { pool, init } = require('./db');
 
-const anthropicOptions = { apiKey: process.env.ANTHROPIC_API_KEY };
-if (process.env.SOCKS_PROXY_URL) {
-  anthropicOptions.httpAgent = new SocksProxyAgent(process.env.SOCKS_PROXY_URL);
-}
-const anthropic = new Anthropic(anthropicOptions);
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+  ...(process.env.ANTHROPIC_BASE_URL && { baseURL: process.env.ANTHROPIC_BASE_URL }),
+});
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 const app = express();
