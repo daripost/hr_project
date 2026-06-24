@@ -585,7 +585,7 @@ app.post('/hr/vacancy', requireAuth, upload.single('vacancy_file'), async (req, 
 
 app.post('/hr/import-db', requireAuth, upload.single('db_file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Файл не передан' });
-  const SQL = await initSqlJs();
+  const SQL = await initSqlJs({ locateFile: file => path.join(__dirname, 'node_modules', 'sql.js', 'dist', file) });
   const db = new SQL.Database(new Uint8Array(req.file.buffer));
 
   const infoStmt = db.prepare('PRAGMA table_info(answers)');
