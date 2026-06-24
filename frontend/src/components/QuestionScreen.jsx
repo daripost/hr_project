@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Timer from './Timer.jsx';
 
+const MIN_TIME = 15;
+
 export default function QuestionScreen({
   block,
   questions,
@@ -14,6 +16,8 @@ export default function QuestionScreen({
   const [pasteBlocked, setPasteBlocked] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState(false);
+  const [minTimeLeft, setMinTimeLeft] = useState(MIN_TIME);
+  const canAdvance = minTimeLeft <= 0;
   const startTime = useRef(Date.now());
   const endTimeRef = useRef(Date.now() + timeLimit * 1000);
   const textareaRef = useRef(null);
@@ -23,6 +27,23 @@ export default function QuestionScreen({
   const total = questions.length;
 
   const handleAnswerChange = (e) => {
+    const inputType = e.nativeEvent?.inputType;
+    if (
+      inputType === 'insertFromPaste' ||
+      inputType === 'insertFromDrop' ||
+      inputType === 'insertFromPasteAsQuotation'
+    ) {
+      e.target.value = answerRef.current;
+      setAnswer(answerRef.current);
+      setPasteBlocked(true);
+      setTimeout(() => setPasteBlocked(false), 2000);
+      fetch('/api/paste-attempts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId, block, questionIndex: index }),
+      }).catch(() => {});
+      return;
+    }
     answerRef.current = e.target.value;
     setAnswer(e.target.value);
   };
@@ -66,26 +87,30 @@ export default function QuestionScreen({
     setSaving(false);
   }, [saving, index, total, block, question, sessionId, timeLimit, onBlockComplete]);
 
-  // Таймер — использует абсолютное endTime, устойчив к throttling фоновых вкладок
   useEffect(() => {
     if (timeLeft <= 0) {
       saveAndAdvance(true);
       return;
     }
-    const id = setTimeout(() => {
+    const id = setInterval(() => {
       const remaining = Math.max(0, Math.ceil((endTimeRef.current - Date.now()) / 1000));
       setTimeLeft(remaining);
     }, 500);
-    return () => clearTimeout(id);
+    return () => clearInterval(id);
   }, [timeLeft, saveAndAdvance]);
 
-  // Фокус на textarea при смене вопроса
+  useEffect(() => {
+    if (minTimeLeft <= 0) return;
+    const id = setTimeout(() => setMinTimeLeft(t => Math.max(0, t - 1)), 1000);
+    return () => clearTimeout(id);
+  }, [minTimeLeft]);
+
   useEffect(() => {
     startTime.current = Date.now();
+    setMinTimeLeft(MIN_TIME);
     textareaRef.current?.focus();
   }, [index]);
 
-  // Блокируем копирование текста страницы (textarea оставляем рабочей)
   useEffect(() => {
     const blockCopy = (e) => { if (e.target.tagName !== 'TEXTAREA') e.preventDefault(); };
     document.addEventListener('copy', blockCopy);
@@ -113,7 +138,6 @@ export default function QuestionScreen({
   return (
     <div style={styles.wrap}>
       <div style={styles.card}>
-        {/* Заголовок */}
         <div style={styles.header}>
           <div style={{ ...styles.blockBadge, background: blockColor + '18', color: blockColor }}>
             {blockLabel}
@@ -133,15 +157,12 @@ export default function QuestionScreen({
           <span style={styles.counter}>{index + 1} / {total}</span>
         </div>
 
-        {/* Таймер */}
         <Timer timeLeft={timeLeft} total={timeLimit} />
 
-        {/* Вопрос */}
         <div style={styles.questionWrap}>
           <p style={styles.questionText}>{question}</p>
         </div>
 
-        {/* Поле ответа */}
         <div style={styles.textareaWrap}>
           <textarea
             ref={textareaRef}
@@ -172,15 +193,21 @@ export default function QuestionScreen({
         <div style={styles.footer}>
           <span style={styles.charCount}>{answer.length} символов</span>
           <button
-            style={{ ...styles.nextBtn, opacity: saving ? 0.6 : 1 }}
-            onClick={() => saveAndAdvance(false)}
-            disabled={saving}
+            style={{
+              ...styles.nextBtn,
+              opacity: (saving || !canAdvance) ? 0.6 : 1,
+              cursor: (saving || !canAdvance) ? 'not-allowed' : 'pointer',
+            }}
+            onClick={() => canAdvance && saveAndAdvance(false)}
+            disabled={saving || !canAdvance}
           >
             {saving
               ? 'Сохранение...'
-              : index + 1 < total
-                ? 'Следующий вопрос →'
-                : 'Завершить блок →'}
+              : !canAdvance
+                ? `Подождите ${minTimeLeft} с...`
+                : index + 1 < total
+                  ? 'Следующий вопрос →'
+                  : 'Завершить блок →'}
           </button>
         </div>
       </div>
@@ -313,7 +340,6 @@ const styles = {
     borderRadius: '8px',
     fontSize: '1rem',
     fontWeight: '600',
-    cursor: 'pointer',
     transition: 'opacity 0.2s',
   },
 };

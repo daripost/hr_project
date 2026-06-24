@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 
-const AUTO_START = 180; // 3 минуты
+const AUTO_START = 30;
 
 const fmtTime = (sec) => {
   if (sec < 60) return sec + ' секунд';
