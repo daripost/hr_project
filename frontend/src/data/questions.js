@@ -21,5 +21,5 @@ export const HARD_SKILLS = [
   'Как реализовать асинхронность в PHP? Назовите известные инструменты и подходы.',
 ];
 
-export const SOFT_TIME_LIMIT = 60;  // 1 минута
-export const HARD_TIME_LIMIT = 60;  // 60 секунд
+export const SOFT_TIME_LIMIT = 120;  // 2 минуты
+export const HARD_TIME_LIMIT = 120;  // 2 минуты

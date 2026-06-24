@@ -66,7 +66,7 @@ db.exec(`
     block TEXT NOT NULL,
     order_index INTEGER NOT NULL,
     text TEXT NOT NULL,
-    time_limit INTEGER NOT NULL DEFAULT 60
+    time_limit INTEGER NOT NULL DEFAULT 120
   );
 
   CREATE TABLE IF NOT EXISTS paste_attempts (
@@ -104,13 +104,16 @@ if (!answerCols.includes('answer_text')) {
   }
 }
 
+// Миграция: обновить time_limit до 120 если ещё стоит старый дефолт 60
+db.exec('UPDATE questions SET time_limit = 120 WHERE time_limit = 60');
+
 // Засеять дефолтные вопросы если таблица пустая
 const { cnt } = db.prepare('SELECT COUNT(*) as cnt FROM questions').get();
 if (cnt === 0) {
   const ins = db.prepare('INSERT INTO questions (block, order_index, text, time_limit) VALUES (?, ?, ?, ?)');
   db.transaction(() => {
-    SOFT_DEFAULTS.forEach((text, i) => ins.run('soft', i, text, 60));
-    HARD_DEFAULTS.forEach((text, i) => ins.run('hard', i, text, 60));
+    SOFT_DEFAULTS.forEach((text, i) => ins.run('soft', i, text, 120));
+    HARD_DEFAULTS.forEach((text, i) => ins.run('hard', i, text, 120));
   })();
 }
 
