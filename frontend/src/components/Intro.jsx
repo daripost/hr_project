@@ -46,7 +46,7 @@ export default function Intro({ onStart, softTimeLimit = 60, hardTimeLimit = 60 
         body: formData,
       });
       if (res.status === 409) {
-        setError('Тест с таким именем уже был пройден. Повторное прохождение не предусмотрено.');
+        setError('Повторное прохождение тестирования не предусмотрено.');
         return;
       }
       if (!res.ok) throw new Error('Ошибка сервера');

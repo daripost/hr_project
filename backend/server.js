@@ -10,6 +10,7 @@ const { v4: uuidv4 } = require('uuid');
 const Anthropic = require('@anthropic-ai/sdk');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
+const mammoth = require('mammoth');
 const { pool, init } = require('./db');
 
 const anthropic = new Anthropic({
@@ -19,6 +20,7 @@ const anthropic = new Anthropic({
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 const app = express();
+app.set('trust proxy', 1);
 
 const CORS_ORIGIN = process.env.CORS_ORIGIN;
 app.use(cors(CORS_ORIGIN ? { origin: CORS_ORIGIN, credentials: true } : {}));
@@ -493,12 +495,17 @@ app.post('/api/sessions', upload.single('resume'), async (req, res) => {
   if (!candidateName?.trim()) return res.status(400).json({ error: 'candidateName is required' });
   if (!req.file) return res.status(400).json({ error: 'resume is required' });
   if (req.file.mimetype !== 'application/pdf') return res.status(400).json({ error: 'resume must be a PDF file' });
+  const ip = (req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || '').replace('::ffff:', '');
   const { rows } = await pool.query('SELECT id FROM sessions WHERE LOWER(candidate_name) = LOWER($1)', [candidateName.trim()]);
   if (rows[0]) return res.status(409).json({ error: 'already_exists' });
+  if (ip) {
+    const { rows: ipRows } = await pool.query('SELECT id FROM sessions WHERE ip_address = $1', [ip]);
+    if (ipRows[0]) return res.status(409).json({ error: 'already_exists_ip' });
+  }
   const id = uuidv4();
   await pool.query(
-    'INSERT INTO sessions (id, candidate_name, resume_pdf, resume_filename) VALUES ($1, $2, $3, $4)',
-    [id, candidateName.trim(), req.file.buffer, req.file.originalname]
+    'INSERT INTO sessions (id, candidate_name, resume_pdf, resume_filename, ip_address) VALUES ($1, $2, $3, $4, $5)',
+    [id, candidateName.trim(), req.file.buffer, req.file.originalname, ip || null]
   );
   res.json({ sessionId: id });
 });
@@ -566,7 +573,8 @@ app.get('/hr/vacancy', requireAuth, async (req, res) => {
 
 app.post('/hr/vacancy', requireAuth, upload.single('vacancy_file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Файл не передан' });
-  const text = req.file.buffer.toString('utf-8');
+  const { value } = await mammoth.extractRawText({ buffer: req.file.buffer });
+  const text = value.trim();
   await pool.query(
     "INSERT INTO settings (key, value) VALUES ('vacancy', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
     [text]
@@ -1277,12 +1285,12 @@ app.get('/hr', requireAuth, async (req, res) => {
     <h1>Вакансия</h1>
     <div class="table-wrap" style="padding:1.5rem 2rem;max-width:800px">
       <p style="font-size:.875rem;color:#64748b;margin-bottom:1.5rem">
-        Загрузите текстовый файл (.txt) с описанием вакансии. Текст будет учитываться при AI-анализе кандидатов.
+        Загрузите файл Word (.docx) с описанием вакансии. Текст будет учитываться при AI-анализе кандидатов.
       </p>
       <div id="vacancy-current" style="margin-bottom:1.5rem"></div>
       <div style="display:flex;flex-direction:column;gap:.75rem">
-        <label style="font-size:.8rem;font-weight:600;color:#374151">Загрузить файл (.txt)</label>
-        <input type="file" id="vacancy-file" accept=".txt,text/plain" style="font-size:.875rem"/>
+        <label style="font-size:.8rem;font-weight:600;color:#374151">Загрузить файл (.docx)</label>
+        <input type="file" id="vacancy-file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" style="font-size:.875rem"/>
         <div style="display:flex;align-items:center;gap:.75rem">
           <button onclick="uploadVacancy()" style="padding:.65rem 1.5rem;background:#2563eb;color:white;border:none;border-radius:8px;font-size:.875rem;font-weight:600;cursor:pointer">Загрузить</button>
           <span id="vacancy-status" style="font-size:.82rem"></span>
