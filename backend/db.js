@@ -76,6 +76,11 @@ async function init() {
     );
   `);
 
+  // AI-колонки — добавляем если ещё нет
+  await pool.query('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ai_verdict TEXT');
+  await pool.query('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ai_score INTEGER');
+  await pool.query('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ai_summary TEXT');
+
   const { rows } = await pool.query('SELECT COUNT(*) AS cnt FROM questions');
   if (parseInt(rows[0].cnt) === 0) {
     const client = await pool.connect();

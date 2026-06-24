@@ -7,7 +7,10 @@ const cors = require('cors');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const { v4: uuidv4 } = require('uuid');
+const Anthropic = require('@anthropic-ai/sdk');
 const { pool, init } = require('./db');
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const app = express();
 
@@ -536,13 +539,70 @@ app.get('/hr/backup', requireAuth, async (req, res) => {
   res.send(JSON.stringify(data, null, 2));
 });
 
+app.post('/api/sessions/:id/analyze', requireAuth, async (req, res) => {
+  const { rows: sRows } = await pool.query('SELECT * FROM sessions WHERE id = $1', [req.params.id]);
+  if (!sRows[0]) return res.status(404).json({ error: 'Session not found' });
+  if (!sRows[0].completed_at) return res.status(400).json({ error: 'Session not completed' });
+
+  const { rows: answers } = await pool.query(
+    'SELECT * FROM answers WHERE session_id = $1 ORDER BY block, question_index', [req.params.id]
+  );
+
+  const fmt = (items, title) => {
+    let t = `\n## ${title}\n`;
+    items.forEach((a, i) => {
+      t += `\nВопрос ${i + 1}: ${a.question_text}\n`;
+      t += `Ответ: ${a.answer_text || '(нет ответа)'}\n`;
+      t += `Время: ${a.time_spent}с ${a.auto_submitted ? '[время вышло]' : '[сам перешёл]'}\n`;
+    });
+    return t;
+  };
+
+  const softAnswers = answers.filter(a => a.block === 'soft');
+  const hardAnswers = answers.filter(a => a.block === 'hard');
+
+  const prompt = `Ты опытный технический HR-специалист. Проанализируй ответы кандидата на вакансию Middle PHP Developer.
+${fmt(softAnswers, 'Soft Skills')}
+${fmt(hardAnswers, 'Hard Skills')}
+
+Оцени кандидата, учитывая качество ответов, глубину знаний, конкретность примеров, количество пропущенных ответов и автопереходов по таймеру.
+
+Ответь строго в JSON без markdown:
+{"verdict":"recommend"|"questionable"|"reject","score":1-10,"summary":"2-3 предложения на русском"}`;
+
+  const message = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 400,
+    messages: [{ role: 'user', content: prompt }],
+  });
+
+  let result;
+  try {
+    result = JSON.parse(message.content[0].text);
+  } catch {
+    return res.status(500).json({ error: 'Не удалось разобрать ответ AI' });
+  }
+
+  const { verdict, score, summary } = result;
+  if (!['recommend', 'questionable', 'reject'].includes(verdict) || !score || !summary) {
+    return res.status(500).json({ error: 'Некорректный формат ответа AI' });
+  }
+
+  await pool.query(
+    'UPDATE sessions SET ai_verdict = $1, ai_score = $2, ai_summary = $3 WHERE id = $4',
+    [verdict, parseInt(score), summary, req.params.id]
+  );
+
+  res.json({ verdict, score: parseInt(score), summary });
+});
+
 app.get('/api/sessions/archived', requireAuth, async (req, res) => {
-  const { rows } = await pool.query('SELECT id, candidate_name, created_at, completed_at, notes FROM sessions WHERE archived = TRUE ORDER BY created_at DESC');
+  const { rows } = await pool.query('SELECT id, candidate_name, created_at, completed_at, notes, ai_verdict, ai_score, ai_summary FROM sessions WHERE archived = TRUE ORDER BY created_at DESC');
   res.json(rows);
 });
 
 app.get('/api/sessions', requireAuth, async (req, res) => {
-  const { rows } = await pool.query('SELECT id, candidate_name, created_at, completed_at, notes FROM sessions WHERE archived = FALSE ORDER BY created_at DESC');
+  const { rows } = await pool.query('SELECT id, candidate_name, created_at, completed_at, notes, ai_verdict, ai_score, ai_summary FROM sessions WHERE archived = FALSE ORDER BY created_at DESC');
   res.json(rows);
 });
 
@@ -710,6 +770,13 @@ app.get('/results/:id', requireAuth, async (req, res) => {
   .notes-textarea:focus{border-color:#2563eb}
   .save-notes-btn{padding:.45rem 1.1rem;background:#0f172a;color:white;border:none;border-radius:6px;font-size:.8rem;font-weight:600;cursor:pointer;margin-top:.5rem}
   .save-notes-btn:hover{background:#1e293b}
+  .ai-result{background:white;border-radius:12px;padding:1.25rem 1.5rem;margin-bottom:1.25rem;box-shadow:0 1px 3px rgba(0,0,0,.06);display:flex;align-items:flex-start;gap:1.25rem;flex-wrap:wrap}
+  .ai-verdict-badge{font-size:.95rem;font-weight:700;padding:.45rem 1rem;border-radius:8px;white-space:nowrap}
+  .ai-recommend{background:#d1fae5;color:#065f46}
+  .ai-questionable{background:#fef3c7;color:#92400e}
+  .ai-reject{background:#fee2e2;color:#991b1b}
+  .ai-summary-text{font-size:.875rem;color:#475569;line-height:1.6;flex:1}
+  .ai-score{font-size:1.1rem;font-weight:700;color:#1e293b;white-space:nowrap}
 </style></head>
 <body><div class="page">
   <div class="top-nav">
@@ -723,6 +790,12 @@ app.get('/results/:id', requireAuth, async (req, res) => {
       <span>${session.completed_at ? 'Завершено: <span class="local-date" data-ts="' + toISO(session.completed_at) + '"></span>' : 'Не завершено'}</span>
     </div>
   </div>
+  ${session.ai_verdict ? `
+  <div class="ai-result">
+    <span class="ai-verdict-badge ai-${session.ai_verdict}">${{ recommend: '✅ Рекомендовать', questionable: '⚠️ Сомнительно', reject: '❌ Не подходит' }[session.ai_verdict]}</span>
+    <span class="ai-score">${session.ai_score}/10</span>
+    <p class="ai-summary-text">${esc(session.ai_summary || '')}</p>
+  </div>` : ''}
   <div class="summary">
     <div class="summary-card">
       <div class="s-title soft">Soft Skills</div>
@@ -931,21 +1004,27 @@ app.get('/results/:id/export.json', requireAuth, async (req, res) => {
 // ─── HR: дашборд ──────────────────────────────────────────────────────────────
 
 app.get('/hr', requireAuth, async (req, res) => {
-  const { rows: sessions } = await pool.query('SELECT id, candidate_name, created_at, completed_at, notes FROM sessions WHERE archived = FALSE ORDER BY created_at DESC');
+  const { rows: sessions } = await pool.query('SELECT id, candidate_name, created_at, completed_at, notes, ai_verdict, ai_score, ai_summary FROM sessions WHERE archived = FALSE ORDER BY created_at DESC');
   const initialIds = JSON.stringify(sessions.map(s => s.id));
 
   const rows = sessions.length === 0
-    ? '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Нет пройденных тестов</td></tr>'
+    ? '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:2rem">Нет пройденных тестов</td></tr>'
     : sessions.map(s => {
         const done = !!s.completed_at;
         const dur = done
           ? Math.round((new Date(s.completed_at) - new Date(s.created_at)) / 60000) + ' мин'
           : '—';
+        const aiCell = s.ai_verdict
+          ? '<span class="ai-badge ai-' + s.ai_verdict + '" title="' + esc(s.ai_summary || '') + '">' +
+            ({ recommend: '✅ Рекомендовать', questionable: '⚠️ Сомнительно', reject: '❌ Не подходит' }[s.ai_verdict]) +
+            ' · ' + s.ai_score + '/10</span>'
+          : (done ? '<button class="ai-btn" data-sid="' + s.id + '">🤖 Анализ</button>' : '—');
         return '<tr id="row-' + s.id + '" data-name="' + esc(s.candidate_name) + '" data-date="' + toISO(s.created_at) + '" data-status="' + (done ? 'done' : 'active') + '">' +
           '<td><strong>' + esc(s.candidate_name) + '</strong>' + (s.notes ? ' <span class="note-badge" title="' + esc(s.notes) + '">📝</span>' : '') + '</td>' +
           '<td><span class="local-date" data-ts="' + toISO(s.created_at) + '"></span></td>' +
           '<td>' + (done ? '<span class="status-done">Завершено</span>' : '<span class="status-prog">В процессе</span>') + '</td>' +
           '<td>' + dur + '</td>' +
+          '<td id="ai-' + s.id + '">' + aiCell + '</td>' +
           '<td><a href="/results/' + s.id + '" target="_blank" class="res-link">Результаты →</a></td>' +
           '<td><button class="arch-btn" data-sid="' + s.id + '" data-name="' + esc(s.candidate_name) + '">В архив</button> <button class="del-btn" data-sid="' + s.id + '" data-name="' + esc(s.candidate_name) + '">Удалить</button></td>' +
           '</tr>';
@@ -998,6 +1077,13 @@ app.get('/hr', requireAuth, async (req, res) => {
   .del-btn{background:none;border:1px solid #fecaca;color:#ef4444;font-size:.78rem;font-weight:600;padding:4px 10px;border-radius:6px;cursor:pointer;transition:background .15s,color .15s}
   .del-btn:hover{background:#fee2e2}
   .del-btn:disabled{opacity:.4;cursor:default}
+  .ai-badge{display:inline-block;font-size:.75rem;font-weight:600;padding:3px 10px;border-radius:20px;cursor:default}
+  .ai-recommend{background:#d1fae5;color:#065f46}
+  .ai-questionable{background:#fef3c7;color:#92400e}
+  .ai-reject{background:#fee2e2;color:#991b1b}
+  .ai-btn{background:none;border:1px solid #e0e7ff;color:#4f46e5;font-size:.78rem;font-weight:600;padding:4px 10px;border-radius:6px;cursor:pointer;transition:background .15s}
+  .ai-btn:hover{background:#e0e7ff}
+  .ai-btn:disabled{opacity:.4;cursor:default}
   .editor-grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem}
   .q-block{background:white;border-radius:14px;box-shadow:0 1px 4px rgba(0,0,0,.07);overflow:hidden}
   .q-block-header{padding:1rem 1.5rem;border-bottom:1px solid #f1f5f9;display:flex;align-items:center;justify-content:space-between;gap:1rem}
@@ -1060,7 +1146,7 @@ app.get('/hr', requireAuth, async (req, res) => {
           <th class="sortable" onclick="sortTable('name')">Кандидат <span class="sort-icon" id="sort-name"></span></th>
           <th class="sortable" onclick="sortTable('date')">Дата начала <span class="sort-icon" id="sort-date">↓</span></th>
           <th class="sortable" onclick="sortTable('status')">Статус <span class="sort-icon" id="sort-status"></span></th>
-          <th>Длительность</th><th>Результаты</th><th></th>
+          <th>Длительность</th><th>AI-оценка</th><th>Результаты</th><th></th>
         </tr></thead>
         <tbody id="candidates-tbody">${rows}</tbody>
       </table>
@@ -1121,7 +1207,7 @@ app.get('/hr', requireAuth, async (req, res) => {
           <th>Кандидат</th><th>Дата начала</th><th>Статус</th><th>Длительность</th><th>Результаты</th><th></th>
         </tr></thead>
         <tbody id="archive-tbody">
-          <tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Загрузка...</td></tr>
+          <tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:2rem">Загрузка...</td></tr>
         </tbody>
       </table>
     </div>
@@ -1140,11 +1226,34 @@ function escHtml(s) {
 document.addEventListener('click', function(e) {
   var btn = e.target.closest('.del-btn');
   if (btn) { deleteSession(btn.getAttribute('data-sid'), btn.getAttribute('data-name')); return; }
+  var aibtn = e.target.closest('.ai-btn');
+  if (aibtn) { analyzeSession(aibtn.getAttribute('data-sid')); return; }
   var abtn = e.target.closest('.arch-btn');
   if (abtn) { archiveSession(abtn.getAttribute('data-sid'), abtn.getAttribute('data-name')); return; }
   var ubtn = e.target.closest('.unarch-btn');
   if (ubtn) unarchiveSession(ubtn.getAttribute('data-sid'), ubtn.getAttribute('data-name'));
 });
+
+var aiLabels = { recommend: '✅ Рекомендовать', questionable: '⚠️ Сомнительно', reject: '❌ Не подходит' };
+
+async function analyzeSession(id) {
+  var btn = document.querySelector('.ai-btn[data-sid="' + id + '"]');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Анализ...'; }
+  try {
+    var res = await fetch('/api/sessions/' + id + '/analyze', { method: 'POST', credentials: 'same-origin' });
+    if (res.status === 401) { location.href = '/hr/login'; return; }
+    if (!res.ok) throw new Error((await res.json()).error || 'Ошибка');
+    var data = await res.json();
+    var cell = document.getElementById('ai-' + id);
+    if (cell) {
+      cell.innerHTML = '<span class="ai-badge ai-' + data.verdict + '" title="' + escHtml(data.summary) + '">' +
+        aiLabels[data.verdict] + ' · ' + data.score + '/10</span>';
+    }
+  } catch(e) {
+    alert('Ошибка AI-анализа: ' + e.message);
+    if (btn) { btn.disabled = false; btn.textContent = '🤖 Анализ'; }
+  }
+}
 
 async function deleteSession(id, name) {
   if (!confirm('Удалить тест кандидата «' + name + '»?\\nЭто действие нельзя отменить.')) return;
@@ -1160,7 +1269,7 @@ async function deleteSession(id, name) {
       row.remove();
       if (tbody && !tbody.querySelector('tr')) {
         var inArchive = tbody.id === 'archive-tbody';
-        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">' + (inArchive ? 'Архив пуст' : 'Нет пройденных тестов') + '</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:2rem">' + (inArchive ? 'Архив пуст' : 'Нет пройденных тестов') + '</td></tr>';
       }
     }
   } catch(e) {
@@ -1182,7 +1291,7 @@ async function archiveSession(id, name) {
       var tbody = row.parentNode;
       row.remove();
       if (tbody && !tbody.querySelector('tr')) {
-        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Нет пройденных тестов</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:2rem">Нет пройденных тестов</td></tr>';
       }
     }
     archiveLoaded = false;
@@ -1205,7 +1314,7 @@ async function unarchiveSession(id, name) {
       var tbody = row.parentNode;
       row.remove();
       if (tbody && !tbody.querySelector('tr')) {
-        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Архив пуст</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:2rem">Архив пуст</td></tr>';
       }
     }
   } catch(e) {
@@ -1228,7 +1337,7 @@ function filterCandidates(query) {
     if (!empty) {
       empty = document.createElement('tr');
       empty.id = 'search-empty-row';
-      empty.innerHTML = '<td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Ничего не найдено</td>';
+      empty.innerHTML = '<td colspan="7" style="text-align:center;color:#94a3b8;padding:2rem">Ничего не найдено</td>';
     }
     document.getElementById('candidates-tbody').appendChild(empty);
   } else if (empty) {
@@ -1278,14 +1387,14 @@ var archiveLoaded = false;
 async function loadArchive(force) {
   if (archiveLoaded && !force) return;
   var tbody = document.getElementById('archive-tbody');
-  tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Загрузка...</td></tr>';
+  tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:2rem">Загрузка...</td></tr>';
   try {
     var res = await fetch('/api/sessions/archived', { credentials: 'same-origin' });
     if (res.status === 401) { location.href = '/hr/login'; return; }
     if (!res.ok) throw new Error();
     var sessions = await res.json();
     if (!sessions.length) {
-      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Архив пуст</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:2rem">Архив пуст</td></tr>';
     } else {
       tbody.innerHTML = sessions.map(function(s) {
         var done = !!s.completed_at;
@@ -1303,7 +1412,7 @@ async function loadArchive(force) {
     }
     archiveLoaded = true;
   } catch(e) {
-    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:2rem">Ошибка загрузки</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:2rem">Ошибка загрузки</td></tr>';
   }
 }
 
