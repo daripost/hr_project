@@ -8,9 +8,11 @@ const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const { v4: uuidv4 } = require('uuid');
 const Anthropic = require('@anthropic-ai/sdk');
+const multer = require('multer');
 const { pool, init } = require('./db');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 const app = express();
 
@@ -482,13 +484,18 @@ app.put('/api/questions', requireAuth, async (req, res) => {
 
 // ─── Сессии ──────────────────────────────────────────────────────────────────
 
-app.post('/api/sessions', async (req, res) => {
-  const { candidateName } = req.body;
+app.post('/api/sessions', upload.single('resume'), async (req, res) => {
+  const candidateName = req.body?.candidateName;
   if (!candidateName?.trim()) return res.status(400).json({ error: 'candidateName is required' });
+  if (!req.file) return res.status(400).json({ error: 'resume is required' });
+  if (req.file.mimetype !== 'application/pdf') return res.status(400).json({ error: 'resume must be a PDF file' });
   const { rows } = await pool.query('SELECT id FROM sessions WHERE LOWER(candidate_name) = LOWER($1)', [candidateName.trim()]);
   if (rows[0]) return res.status(409).json({ error: 'already_exists' });
   const id = uuidv4();
-  await pool.query('INSERT INTO sessions (id, candidate_name) VALUES ($1, $2)', [id, candidateName.trim()]);
+  await pool.query(
+    'INSERT INTO sessions (id, candidate_name, resume_pdf, resume_filename) VALUES ($1, $2, $3, $4)',
+    [id, candidateName.trim(), req.file.buffer, req.file.originalname]
+  );
   res.json({ sessionId: id });
 });
 
@@ -537,6 +544,15 @@ app.get('/hr/backup', requireAuth, async (req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Content-Disposition', "attachment; filename*=UTF-8''" + encodeURIComponent(filename));
   res.send(JSON.stringify(data, null, 2));
+});
+
+app.get('/hr/sessions/:id/resume', requireAuth, async (req, res) => {
+  const { rows } = await pool.query('SELECT resume_pdf, resume_filename FROM sessions WHERE id = $1', [req.params.id]);
+  if (!rows[0] || !rows[0].resume_pdf) return res.status(404).send('Резюме не найдено');
+  const filename = rows[0].resume_filename || 'resume.pdf';
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', "inline; filename*=UTF-8''" + encodeURIComponent(filename));
+  res.send(rows[0].resume_pdf);
 });
 
 app.post('/api/sessions/:id/analyze', requireAuth, async (req, res) => {
@@ -781,7 +797,10 @@ app.get('/results/:id', requireAuth, async (req, res) => {
 <body><div class="page">
   <div class="top-nav">
     <a href="/hr" class="back">← Все кандидаты</a>
-    <a href="/results/${session.id}/export.txt" class="export-btn" download>↓ Скачать результаты (TXT)</a>
+    <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+      ${session.resume_filename ? `<a href="/hr/sessions/${session.id}/resume" class="export-btn" target="_blank">📄 Резюме PDF</a>` : ''}
+      <a href="/results/${session.id}/export.txt" class="export-btn" download>↓ Скачать результаты (TXT)</a>
+    </div>
   </div>
   <div class="page-header">
     <div class="candidate-name">${esc(session.candidate_name)}</div>

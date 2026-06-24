@@ -80,6 +80,9 @@ async function init() {
   await pool.query('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ai_verdict TEXT');
   await pool.query('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ai_score INTEGER');
   await pool.query('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ai_summary TEXT');
+  // Резюме — добавляем если ещё нет
+  await pool.query('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS resume_pdf BYTEA');
+  await pool.query('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS resume_filename TEXT');
 
   const { rows } = await pool.query('SELECT COUNT(*) AS cnt FROM questions');
   if (parseInt(rows[0].cnt) === 0) {

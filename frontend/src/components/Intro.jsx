@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 
 const fmtTime = (sec) => {
   if (sec < 60) return sec + ' секунд';
@@ -10,21 +10,40 @@ const fmtTime = (sec) => {
 
 export default function Intro({ onStart, softTimeLimit = 60, hardTimeLimit = 60 }) {
   const [name, setName] = useState('');
+  const [resume, setResume] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const fileInputRef = useRef(null);
+
+  const handleFileChange = (e) => {
+    const file = e.target.files[0];
+    if (!file) { setResume(null); return; }
+    if (file.type !== 'application/pdf') {
+      setResume(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      setError('Пожалуйста, выберите файл в формате PDF.');
+      return;
+    }
+    setError('');
+    setResume(file);
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     const trimmed = name.trim();
     if (!trimmed) return;
+    if (!resume) { setError('Пожалуйста, прикрепите резюме в формате PDF.'); return; }
 
     setLoading(true);
     setError('');
     try {
+      const formData = new FormData();
+      formData.append('candidateName', trimmed);
+      formData.append('resume', resume);
+
       const res = await fetch('/api/sessions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ candidateName: trimmed }),
+        body: formData,
       });
       if (res.status === 409) {
         setError('Тест с таким именем уже был пройден. Повторное прохождение не предусмотрено.');
@@ -39,6 +58,8 @@ export default function Intro({ onStart, softTimeLimit = 60, hardTimeLimit = 60 
       setLoading(false);
     }
   };
+
+  const canSubmit = !loading && name.trim() && resume;
 
   return (
     <div style={styles.wrap}>
@@ -66,8 +87,35 @@ export default function Intro({ onStart, softTimeLimit = 60, hardTimeLimit = 60 
             autoFocus
             required
           />
+
+          <label style={styles.label}>
+            Резюме <span style={styles.required}>*</span>
+            <span style={styles.labelHint}> — только PDF</span>
+          </label>
+          <div style={styles.fileWrap}>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/pdf,.pdf"
+              onChange={handleFileChange}
+              style={styles.fileInput}
+              required
+            />
+            {resume && (
+              <div style={styles.fileChosen}>
+                <span style={styles.fileIcon}>📄</span>
+                <span style={styles.fileName}>{resume.name}</span>
+                <button
+                  type="button"
+                  style={styles.fileRemove}
+                  onClick={() => { setResume(null); if (fileInputRef.current) fileInputRef.current.value = ''; }}
+                >×</button>
+              </div>
+            )}
+          </div>
+
           {error && <p style={styles.error}>{error}</p>}
-          <button type="submit" style={styles.btn} disabled={loading || !name.trim()}>
+          <button type="submit" style={{ ...styles.btn, ...(canSubmit ? {} : styles.btnDisabled) }} disabled={!canSubmit}>
             {loading ? 'Подготовка...' : 'Начать тестирование →'}
           </button>
         </form>
@@ -136,6 +184,8 @@ const styles = {
   ruleIcon: { fontSize: '1rem' },
   form: { display: 'flex', flexDirection: 'column', gap: '0.75rem' },
   label: { fontWeight: '500', fontSize: '0.875rem', color: '#374151' },
+  required: { color: '#ef4444' },
+  labelHint: { fontWeight: '400', color: '#94a3b8', fontSize: '0.8rem' },
   input: {
     padding: '0.75rem 1rem',
     borderRadius: '8px',
@@ -143,6 +193,44 @@ const styles = {
     fontSize: '1rem',
     outline: 'none',
     transition: 'border-color 0.2s',
+  },
+  fileWrap: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '0.5rem',
+  },
+  fileInput: {
+    padding: '0.5rem 0',
+    fontSize: '0.9rem',
+    color: '#374151',
+    cursor: 'pointer',
+  },
+  fileChosen: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.5rem',
+    background: '#f0fdf4',
+    border: '1px solid #bbf7d0',
+    borderRadius: '8px',
+    padding: '0.5rem 0.75rem',
+  },
+  fileIcon: { fontSize: '1rem' },
+  fileName: {
+    fontSize: '0.875rem',
+    color: '#166534',
+    flex: 1,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+  },
+  fileRemove: {
+    background: 'none',
+    border: 'none',
+    color: '#64748b',
+    fontSize: '1.1rem',
+    cursor: 'pointer',
+    padding: '0 2px',
+    lineHeight: 1,
   },
   btn: {
     marginTop: '0.5rem',
@@ -155,6 +243,10 @@ const styles = {
     fontWeight: '600',
     cursor: 'pointer',
     transition: 'background 0.2s',
+  },
+  btnDisabled: {
+    background: '#93c5fd',
+    cursor: 'not-allowed',
   },
   error: {
     color: '#dc2626',
