@@ -76,6 +76,13 @@ async function init() {
     );
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+  `);
+
   // AI-колонки — добавляем если ещё нет
   await pool.query('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ai_verdict TEXT');
   await pool.query('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ai_score INTEGER');

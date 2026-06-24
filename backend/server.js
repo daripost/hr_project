@@ -9,6 +9,7 @@ const rateLimit = require('express-rate-limit');
 const { v4: uuidv4 } = require('uuid');
 const Anthropic = require('@anthropic-ai/sdk');
 const multer = require('multer');
+const pdfParse = require('pdf-parse');
 const { pool, init } = require('./db');
 
 const anthropic = new Anthropic({
@@ -558,6 +559,21 @@ app.get('/hr/sessions/:id/resume', requireAuth, async (req, res) => {
   res.send(rows[0].resume_pdf);
 });
 
+app.get('/hr/vacancy', requireAuth, async (req, res) => {
+  const { rows } = await pool.query("SELECT value FROM settings WHERE key = 'vacancy'");
+  res.json({ text: rows[0]?.value || '' });
+});
+
+app.post('/hr/vacancy', requireAuth, upload.single('vacancy_file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Файл не передан' });
+  const text = req.file.buffer.toString('utf-8');
+  await pool.query(
+    "INSERT INTO settings (key, value) VALUES ('vacancy', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    [text]
+  );
+  res.json({ ok: true, text });
+});
+
 app.post('/api/sessions/:id/analyze', requireAuth, async (req, res) => {
   const { rows: sRows } = await pool.query('SELECT * FROM sessions WHERE id = $1', [req.params.id]);
   if (!sRows[0]) return res.status(404).json({ error: 'Session not found' });
@@ -580,14 +596,30 @@ app.post('/api/sessions/:id/analyze', requireAuth, async (req, res) => {
   const softAnswers = answers.filter(a => a.block === 'soft');
   const hardAnswers = answers.filter(a => a.block === 'hard');
 
-  const prompt = `Ты опытный технический HR-специалист. Проанализируй ответы кандидата на вакансию Middle PHP Developer.
-${fmt(softAnswers, 'Soft Skills')}
-${fmt(hardAnswers, 'Hard Skills')}
+  const [vacancyRes] = await Promise.all([
+    pool.query("SELECT value FROM settings WHERE key = 'vacancy'"),
+  ]);
+  const vacancyText = vacancyRes.rows[0]?.value || '';
 
-Оцени кандидата, учитывая качество ответов, глубину знаний, конкретность примеров, количество пропущенных ответов и автопереходов по таймеру.
+  let resumeText = '';
+  if (sRows[0].resume_pdf) {
+    try {
+      const parsed = await pdfParse(sRows[0].resume_pdf);
+      resumeText = parsed.text?.trim() || '';
+    } catch { /* игнорируем ошибку парсинга PDF */ }
+  }
 
-Ответь строго в JSON без markdown:
-{"verdict":"recommend"|"questionable"|"reject","score":1-10,"summary":"2-3 предложения на русском"}`;
+  const sections = [];
+  if (vacancyText) sections.push('## Вакансия\n' + vacancyText);
+  if (resumeText) sections.push('## Резюме кандидата\n' + resumeText);
+  sections.push(fmt(softAnswers, 'Soft Skills'));
+  sections.push(fmt(hardAnswers, 'Hard Skills'));
+
+  const prompt = 'Ты опытный технический HR-специалист. Проанализируй кандидата на должность Middle PHP Developer.\n\n' +
+    sections.join('\n\n') +
+    '\n\nОцени кандидата, учитывая соответствие вакансии, резюме, качество ответов, глубину знаний, конкретность примеров, пропущенные ответы и автопереходы по таймеру.\n\n' +
+    'Ответь строго в JSON без markdown:\n' +
+    '{"verdict":"recommend"|"questionable"|"reject","score":1-10,"summary":"2-3 предложения на русском"}';
 
   const message = await anthropic.messages.create({
     model: 'claude-haiku-4-5-20251001',
@@ -1146,6 +1178,9 @@ app.get('/hr', requireAuth, async (req, res) => {
   <button class="nav-btn" data-tab="archive" onclick="switchTab('archive', this)">
     <span class="nav-icon">📦</span> Архив
   </button>
+  <button class="nav-btn" data-tab="vacancy" onclick="switchTab('vacancy', this)">
+    <span class="nav-icon">💼</span> Вакансия
+  </button>
   <a href="/hr/account" class="nav-btn" style="text-decoration:none">
     <span class="nav-icon">⚙️</span> Аккаунт
   </a>
@@ -1234,6 +1269,25 @@ app.get('/hr', requireAuth, async (req, res) => {
           <tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:2rem">Загрузка...</td></tr>
         </tbody>
       </table>
+    </div>
+  </div>
+
+  <!-- Вакансия -->
+  <div id="tab-vacancy" class="tab-content">
+    <h1>Вакансия</h1>
+    <div class="table-wrap" style="padding:1.5rem 2rem;max-width:800px">
+      <p style="font-size:.875rem;color:#64748b;margin-bottom:1.5rem">
+        Загрузите текстовый файл (.txt) с описанием вакансии. Текст будет учитываться при AI-анализе кандидатов.
+      </p>
+      <div id="vacancy-current" style="margin-bottom:1.5rem"></div>
+      <div style="display:flex;flex-direction:column;gap:.75rem">
+        <label style="font-size:.8rem;font-weight:600;color:#374151">Загрузить файл (.txt)</label>
+        <input type="file" id="vacancy-file" accept=".txt,text/plain" style="font-size:.875rem"/>
+        <div style="display:flex;align-items:center;gap:.75rem">
+          <button onclick="uploadVacancy()" style="padding:.65rem 1.5rem;background:#2563eb;color:white;border:none;border-radius:8px;font-size:.875rem;font-weight:600;cursor:pointer">Загрузить</button>
+          <span id="vacancy-status" style="font-size:.82rem"></span>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1457,6 +1511,41 @@ function switchTab(tab, btn) {
   btn.classList.add('active');
   if (tab === 'questions' && !questionsData) loadQuestions();
   if (tab === 'archive') loadArchive(false);
+  if (tab === 'vacancy') loadVacancy();
+}
+
+async function loadVacancy() {
+  var res = await fetch('/hr/vacancy', { credentials: 'same-origin' });
+  var data = await res.json();
+  var el = document.getElementById('vacancy-current');
+  if (data.text) {
+    el.innerHTML = '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:1rem;max-height:300px;overflow-y:auto"><pre style="font-size:.82rem;color:#374151;white-space:pre-wrap;margin:0">' + escHtml(data.text) + '</pre></div><p style="font-size:.78rem;color:#10b981;margin-top:.5rem">✓ Вакансия загружена</p>';
+  } else {
+    el.innerHTML = '<p style="font-size:.875rem;color:#94a3b8">Вакансия ещё не загружена</p>';
+  }
+}
+
+async function uploadVacancy() {
+  var file = document.getElementById('vacancy-file').files[0];
+  var status = document.getElementById('vacancy-status');
+  if (!file) { status.textContent = 'Выберите файл'; status.style.color = '#ef4444'; return; }
+  var fd = new FormData();
+  fd.append('vacancy_file', file);
+  status.textContent = 'Загрузка...'; status.style.color = '#64748b';
+  try {
+    var res = await fetch('/hr/vacancy', { method: 'POST', body: fd, credentials: 'same-origin' });
+    var data = await res.json();
+    if (data.ok) {
+      status.textContent = 'Сохранено ✓'; status.style.color = '#10b981';
+      loadVacancy();
+      document.getElementById('vacancy-file').value = '';
+    } else {
+      status.textContent = data.error || 'Ошибка'; status.style.color = '#ef4444';
+    }
+  } catch(e) {
+    status.textContent = 'Ошибка сети'; status.style.color = '#ef4444';
+  }
+  setTimeout(function() { status.textContent = ''; }, 3000);
 }
 
 async function loadQuestions() {
