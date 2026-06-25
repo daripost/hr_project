@@ -500,7 +500,7 @@ app.post('/api/sessions', upload.single('resume'), async (req, res) => {
   const { rows } = await pool.query('SELECT id FROM sessions WHERE LOWER(candidate_name) = LOWER($1)', [candidateName.trim()]);
   if (rows[0]) return res.status(409).json({ error: 'already_exists' });
   if (ip) {
-    const { rows: ipRows } = await pool.query('SELECT id FROM sessions WHERE ip_address = $1', [ip]);
+    const { rows: ipRows } = await pool.query('SELECT id FROM sessions WHERE ip_address = $1 AND completed_at IS NOT NULL', [ip]);
     if (ipRows[0]) return res.status(409).json({ error: 'already_exists_ip' });
   }
   const id = uuidv4();
