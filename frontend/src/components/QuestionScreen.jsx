@@ -8,9 +8,10 @@ export default function QuestionScreen({
   questions,
   timeLimit,
   sessionId,
+  startIndex = 0,
   onBlockComplete,
 }) {
-  const [index, setIndex] = useState(0);
+  const [index, setIndex] = useState(startIndex);
   const [timeLeft, setTimeLeft] = useState(timeLimit);
   const [answer, setAnswer] = useState('');
   const [pasteBlocked, setPasteBlocked] = useState(false);

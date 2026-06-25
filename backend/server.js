@@ -508,18 +508,58 @@ app.post('/api/sessions', upload.single('resume'), async (req, res) => {
   if (req.file.mimetype !== 'application/pdf') return res.status(400).json({ error: 'resume must be a PDF file' });
   const ip = (req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || '').replace('::ffff:', '');
   const deviceId = req.cookies.device_id || null;
-  const { rows } = await pool.query('SELECT id FROM sessions WHERE LOWER(candidate_name) = LOWER($1)', [candidateName.trim()]);
-  if (rows[0]) return res.status(409).json({ error: 'already_exists' });
+
+  // Блокируем только если есть ЗАВЕРШЁННАЯ сессия с таким именем или device_id
+  const { rows: completedByName } = await pool.query(
+    'SELECT id FROM sessions WHERE LOWER(candidate_name) = LOWER($1) AND completed_at IS NOT NULL',
+    [candidateName.trim()]
+  );
+  if (completedByName[0]) return res.status(409).json({ error: 'already_exists' });
   if (deviceId) {
-    const { rows: devRows } = await pool.query('SELECT id FROM sessions WHERE device_id = $1 AND completed_at IS NOT NULL', [deviceId]);
-    if (devRows[0]) return res.status(409).json({ error: 'already_exists' });
+    const { rows: completedByDevice } = await pool.query(
+      'SELECT id FROM sessions WHERE device_id = $1 AND completed_at IS NOT NULL',
+      [deviceId]
+    );
+    if (completedByDevice[0]) return res.status(409).json({ error: 'already_exists' });
   }
+
+  // Удаляем незавершённые сессии с тем же именем или device_id (кандидат бросил на середине)
+  const { rows: stale } = await pool.query(
+    'SELECT id FROM sessions WHERE (LOWER(candidate_name) = LOWER($1) OR (device_id = $2 AND $2 IS NOT NULL)) AND completed_at IS NULL',
+    [candidateName.trim(), deviceId]
+  );
+  for (const s of stale) {
+    await pool.query('DELETE FROM paste_attempts WHERE session_id = $1', [s.id]);
+    await pool.query('DELETE FROM answers WHERE session_id = $1', [s.id]);
+    await pool.query('DELETE FROM sessions WHERE id = $1', [s.id]);
+  }
+
   const id = uuidv4();
   await pool.query(
     'INSERT INTO sessions (id, candidate_name, resume_pdf, resume_filename, ip_address, device_id) VALUES ($1, $2, $3, $4, $5, $6)',
     [id, candidateName.trim(), req.file.buffer, req.file.originalname, ip || null, deviceId]
   );
   res.json({ sessionId: id });
+});
+
+app.get('/api/sessions/:id/progress', async (req, res) => {
+  const { rows: sess } = await pool.query('SELECT completed_at FROM sessions WHERE id = $1', [req.params.id]);
+  if (!sess[0]) return res.status(404).json({ error: 'not found' });
+  if (sess[0].completed_at) return res.json({ completed: true });
+
+  const { rows: qtotals } = await pool.query('SELECT block, COUNT(*) as cnt FROM questions GROUP BY block');
+  const softTotal = parseInt(qtotals.find(q => q.block === 'soft')?.cnt || 0);
+
+  const { rows: answered } = await pool.query(
+    'SELECT block, COUNT(*) as cnt FROM answers WHERE session_id = $1 GROUP BY block',
+    [req.params.id]
+  );
+  const softAnswered = parseInt(answered.find(a => a.block === 'soft')?.cnt || 0);
+  const hardAnswered = parseInt(answered.find(a => a.block === 'hard')?.cnt || 0);
+
+  if (hardAnswered > 0) return res.json({ completed: false, screen: 'hard', questionIndex: hardAnswered });
+  if (softAnswered >= softTotal) return res.json({ completed: false, screen: 'transition', questionIndex: 0 });
+  return res.json({ completed: false, screen: 'soft', questionIndex: softAnswered });
 });
 
 app.post('/api/sessions/:id/complete', async (req, res) => {

@@ -19,6 +19,7 @@ export default function App() {
   const [sessionId, setSessionId] = useState(null);
   const [candidateName, setCandidateName] = useState('');
   const [prevAttempt, setPrevAttempt] = useState(null);
+  const [startIndex, setStartIndex] = useState(0);
 
   useEffect(() => {
     const stored = localStorage.getItem(STORAGE_KEY);
@@ -28,18 +29,41 @@ export default function App() {
     }
 
     const loadQuestions = fetch('/api/questions').then(r => r.json()).catch(() => FALLBACK);
-    const checkDevice = attempt ? fetch('/api/check-device').then(r => r.json()).catch(() => ({ blocked: true })) : Promise.resolve({ blocked: false });
 
-    Promise.all([loadQuestions, checkDevice]).then(([data, { blocked }]) => {
-      setQuestions(data);
-      if (attempt && !blocked) {
-        localStorage.removeItem(STORAGE_KEY);
-        setPrevAttempt(null);
-        setScreen('intro');
-      } else {
-        setScreen(attempt ? 'already_done' : 'intro');
-      }
-    });
+    if (attempt?.sessionId && !attempt?.completedAt) {
+      // Есть незавершённая сессия — восстанавливаем прогресс
+      Promise.all([
+        loadQuestions,
+        fetch(`/api/sessions/${attempt.sessionId}/progress`).then(r => r.json()).catch(() => null),
+      ]).then(([data, progress]) => {
+        setQuestions(data);
+        if (!progress || progress.completed) {
+          setScreen(progress?.completed ? 'already_done' : 'intro');
+        } else {
+          setSessionId(attempt.sessionId);
+          setCandidateName(attempt.name);
+          setStartIndex(progress.questionIndex);
+          setScreen(progress.screen);
+        }
+      });
+    } else if (attempt?.completedAt) {
+      // Сессия завершена — проверяем что запись ещё в базе
+      Promise.all([
+        loadQuestions,
+        fetch('/api/check-device').then(r => r.json()).catch(() => ({ blocked: true })),
+      ]).then(([data, { blocked }]) => {
+        setQuestions(data);
+        if (!blocked) {
+          localStorage.removeItem(STORAGE_KEY);
+          setPrevAttempt(null);
+          setScreen('intro');
+        } else {
+          setScreen('already_done');
+        }
+      });
+    } else {
+      loadQuestions.then(data => { setQuestions(data); setScreen('intro'); });
+    }
   }, []);
 
   if (screen === 'loading') {
@@ -53,7 +77,8 @@ export default function App() {
   const handleStart = (sid, name) => {
     setSessionId(sid);
     setCandidateName(name);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ name, startedAt: Date.now() }));
+    setStartIndex(0);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ name, sessionId: sid, startedAt: Date.now() }));
     setScreen('soft');
   };
 
@@ -110,13 +135,14 @@ export default function App() {
           questions={questions.soft.questions}
           timeLimit={questions.soft.timeLimit}
           sessionId={sessionId}
+          startIndex={startIndex}
           onBlockComplete={handleSoftComplete}
         />
       )}
       {screen === 'transition' && (
         <BlockTransition
           hardTimeLimit={questions.hard.timeLimit}
-          onContinue={() => setScreen('hard')}
+          onContinue={() => { setStartIndex(0); setScreen('hard'); }}
         />
       )}
       {screen === 'hard' && (
@@ -126,6 +152,7 @@ export default function App() {
           questions={questions.hard.questions}
           timeLimit={questions.hard.timeLimit}
           sessionId={sessionId}
+          startIndex={startIndex}
           onBlockComplete={handleHardComplete}
         />
       )}
