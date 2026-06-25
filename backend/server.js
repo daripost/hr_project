@@ -455,11 +455,10 @@ app.delete('/api/hr/users/:id', requireAuth, async (req, res) => {
 
 app.get('/api/check-device', async (req, res) => {
   const deviceId = req.cookies.device_id || null;
-  const ip = (req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || '').replace('::ffff:', '');
-  if (!deviceId && !ip) return res.json({ blocked: false });
+  if (!deviceId) return res.json({ blocked: false });
   const { rows } = await pool.query(
-    'SELECT id FROM sessions WHERE (device_id = $1 OR ip_address = $2) AND completed_at IS NOT NULL LIMIT 1',
-    [deviceId, ip]
+    'SELECT id FROM sessions WHERE device_id = $1 AND completed_at IS NOT NULL LIMIT 1',
+    [deviceId]
   );
   res.json({ blocked: rows.length > 0 });
 });
@@ -514,10 +513,6 @@ app.post('/api/sessions', upload.single('resume'), async (req, res) => {
   if (deviceId) {
     const { rows: devRows } = await pool.query('SELECT id FROM sessions WHERE device_id = $1 AND completed_at IS NOT NULL', [deviceId]);
     if (devRows[0]) return res.status(409).json({ error: 'already_exists' });
-  }
-  if (ip) {
-    const { rows: ipRows } = await pool.query('SELECT id FROM sessions WHERE ip_address = $1 AND completed_at IS NOT NULL', [ip]);
-    if (ipRows[0]) return res.status(409).json({ error: 'already_exists' });
   }
   const id = uuidv4();
   await pool.query(
