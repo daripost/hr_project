@@ -1412,6 +1412,7 @@ app.get('/hr', requireAuth, async (req, res) => {
     <div class="table-wrap">
       <div class="table-header">
         <h2>Архивные тесты</h2>
+        <input type="search" id="archive-search" placeholder="Поиск по имени..." oninput="filterArchive()" style="padding:.5rem .75rem;border:1.5px solid #e2e8f0;border-radius:8px;font-size:.875rem;outline:none;width:220px"/>
         <button class="refresh-btn" onclick="loadArchive(true)">↻ Обновить</button>
       </div>
       <table>
@@ -1632,6 +1633,35 @@ async function checkNewSessions() {
 setInterval(checkNewSessions, 60000);
 
 var archiveLoaded = false;
+var archiveSessions = [];
+
+function renderArchive(sessions) {
+  var tbody = document.getElementById('archive-tbody');
+  if (!sessions.length) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:2rem">Ничего не найдено</td></tr>';
+    return;
+  }
+  tbody.innerHTML = sessions.map(function(s) {
+    var done = !!s.completed_at;
+    var dur = done ? Math.round((new Date(s.completed_at) - new Date(s.created_at)) / 60000) + ' мин' : '—';
+    return '<tr id="row-' + s.id + '">' +
+      '<td><strong>' + escHtml(s.candidate_name) + '</strong></td>' +
+      '<td><span class="local-date" data-ts="' + (s.created_at || '') + '"></span></td>' +
+      '<td>' + (done ? '<span class="status-done">Завершено</span>' : '<span class="status-prog">В процессе</span>') + '</td>' +
+      '<td>' + dur + '</td>' +
+      '<td><a href="/results/' + s.id + '" target="_blank" class="res-link">Результаты →</a></td>' +
+      '<td><button class="unarch-btn" data-sid="' + s.id + '" data-name="' + escHtml(s.candidate_name) + '">Из архива</button><button class="del-btn" data-sid="' + s.id + '" data-name="' + escHtml(s.candidate_name) + '">Удалить</button></td>' +
+      '</tr>';
+  }).join('');
+  formatLocalDates();
+}
+
+function filterArchive() {
+  var q = (document.getElementById('archive-search').value || '').toLowerCase().trim();
+  var filtered = q ? archiveSessions.filter(function(s) { return s.candidate_name.toLowerCase().includes(q); }) : archiveSessions;
+  renderArchive(filtered);
+}
+
 async function loadArchive(force) {
   if (archiveLoaded && !force) return;
   var tbody = document.getElementById('archive-tbody');
@@ -1640,23 +1670,11 @@ async function loadArchive(force) {
     var res = await fetch('/api/sessions/archived', { credentials: 'same-origin' });
     if (res.status === 401) { location.href = '/hr/login'; return; }
     if (!res.ok) throw new Error();
-    var sessions = await res.json();
-    if (!sessions.length) {
+    archiveSessions = await res.json();
+    if (!archiveSessions.length) {
       tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:2rem">Архив пуст</td></tr>';
     } else {
-      tbody.innerHTML = sessions.map(function(s) {
-        var done = !!s.completed_at;
-        var dur = done ? Math.round((new Date(s.completed_at) - new Date(s.created_at)) / 60000) + ' мин' : '—';
-        return '<tr id="row-' + s.id + '">' +
-          '<td><strong>' + escHtml(s.candidate_name) + '</strong></td>' +
-          '<td><span class="local-date" data-ts="' + (s.created_at || '') + '"></span></td>' +
-          '<td>' + (done ? '<span class="status-done">Завершено</span>' : '<span class="status-prog">В процессе</span>') + '</td>' +
-          '<td>' + dur + '</td>' +
-          '<td><a href="/results/' + s.id + '" target="_blank" class="res-link">Результаты →</a></td>' +
-          '<td><button class="unarch-btn" data-sid="' + s.id + '" data-name="' + escHtml(s.candidate_name) + '">Из архива</button><button class="del-btn" data-sid="' + s.id + '" data-name="' + escHtml(s.candidate_name) + '">Удалить</button></td>' +
-          '</tr>';
-      }).join('');
-      formatLocalDates();
+      filterArchive();
     }
     archiveLoaded = true;
   } catch(e) {
