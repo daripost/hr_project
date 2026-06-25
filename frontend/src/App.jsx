@@ -22,13 +22,24 @@ export default function App() {
 
   useEffect(() => {
     const stored = localStorage.getItem(STORAGE_KEY);
+    let attempt = null;
     if (stored) {
-      try { setPrevAttempt(JSON.parse(stored)); } catch { localStorage.removeItem(STORAGE_KEY); }
+      try { attempt = JSON.parse(stored); setPrevAttempt(attempt); } catch { localStorage.removeItem(STORAGE_KEY); }
     }
-    fetch('/api/questions')
-      .then(r => r.json())
-      .then(data => { setQuestions(data); setScreen(stored ? 'already_done' : 'intro'); })
-      .catch(() => { setQuestions(FALLBACK); setScreen(stored ? 'already_done' : 'intro'); });
+
+    const loadQuestions = fetch('/api/questions').then(r => r.json()).catch(() => FALLBACK);
+    const checkDevice = attempt ? fetch('/api/check-device').then(r => r.json()).catch(() => ({ blocked: true })) : Promise.resolve({ blocked: false });
+
+    Promise.all([loadQuestions, checkDevice]).then(([data, { blocked }]) => {
+      setQuestions(data);
+      if (attempt && !blocked) {
+        localStorage.removeItem(STORAGE_KEY);
+        setPrevAttempt(null);
+        setScreen('intro');
+      } else {
+        setScreen(attempt ? 'already_done' : 'intro');
+      }
+    });
   }, []);
 
   if (screen === 'loading') {

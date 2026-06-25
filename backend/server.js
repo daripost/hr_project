@@ -453,6 +453,17 @@ app.delete('/api/hr/users/:id', requireAuth, async (req, res) => {
 
 // ─── Вопросы ────────────────────────────────────────────────────────────────
 
+app.get('/api/check-device', async (req, res) => {
+  const deviceId = req.cookies.device_id || null;
+  const ip = (req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || '').replace('::ffff:', '');
+  if (!deviceId && !ip) return res.json({ blocked: false });
+  const { rows } = await pool.query(
+    'SELECT id FROM sessions WHERE (device_id = $1 OR ip_address = $2) AND completed_at IS NOT NULL LIMIT 1',
+    [deviceId, ip]
+  );
+  res.json({ blocked: rows.length > 0 });
+});
+
 app.get('/api/questions', async (req, res) => {
   const { rows: soft } = await pool.query("SELECT text, time_limit FROM questions WHERE block='soft' ORDER BY order_index");
   const { rows: hard } = await pool.query("SELECT text, time_limit FROM questions WHERE block='hard' ORDER BY order_index");
