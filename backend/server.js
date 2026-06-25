@@ -800,13 +800,24 @@ app.post('/api/sessions/:id/analyze', requireAuth, async (req, res) => {
 });
 
 app.get('/api/sessions/archived', requireAuth, async (req, res) => {
-  const { rows } = await pool.query('SELECT id, candidate_name, created_at, completed_at, notes, ai_verdict, ai_score, ai_summary FROM sessions WHERE archived = TRUE ORDER BY created_at DESC');
+  const { rows } = await pool.query('SELECT id, candidate_name, created_at, completed_at, notes, ai_verdict, ai_score, ai_summary, hr_decision FROM sessions WHERE archived = TRUE ORDER BY created_at DESC');
   res.json(rows);
 });
 
 app.get('/api/sessions', requireAuth, async (req, res) => {
-  const { rows } = await pool.query('SELECT id, candidate_name, created_at, completed_at, notes, ai_verdict, ai_score, ai_summary FROM sessions WHERE archived = FALSE ORDER BY created_at DESC');
+  const { rows } = await pool.query('SELECT id, candidate_name, created_at, completed_at, notes, ai_verdict, ai_score, ai_summary, hr_decision FROM sessions WHERE archived = FALSE ORDER BY created_at DESC');
   res.json(rows);
+});
+
+app.put('/api/sessions/:id/decision', requireAuth, async (req, res) => {
+  const { decision } = req.body;
+  if (decision !== null && decision !== 'yes' && decision !== 'no') {
+    return res.status(400).json({ error: 'decision must be yes, no, or null' });
+  }
+  const { rows } = await pool.query('SELECT id FROM sessions WHERE id = $1', [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: 'not found' });
+  await pool.query('UPDATE sessions SET hr_decision = $1 WHERE id = $2', [decision || null, req.params.id]);
+  res.json({ ok: true });
 });
 
 // ─── Попытки вставки ─────────────────────────────────────────────────────────
@@ -1210,11 +1221,11 @@ app.get('/results/:id/export.json', requireAuth, async (req, res) => {
 // ─── HR: дашборд ──────────────────────────────────────────────────────────────
 
 app.get('/hr', requireAuth, async (req, res) => {
-  const { rows: sessions } = await pool.query('SELECT id, candidate_name, created_at, completed_at, notes, ai_verdict, ai_score, ai_summary FROM sessions WHERE archived = FALSE ORDER BY created_at DESC');
+  const { rows: sessions } = await pool.query('SELECT id, candidate_name, created_at, completed_at, notes, ai_verdict, ai_score, ai_summary, hr_decision FROM sessions WHERE archived = FALSE ORDER BY created_at DESC');
   const initialIds = JSON.stringify(sessions.map(s => s.id));
 
   const rows = sessions.length === 0
-    ? '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:2rem">Нет пройденных тестов</td></tr>'
+    ? '<tr><td colspan="8" style="text-align:center;color:#94a3b8;padding:2rem">Нет пройденных тестов</td></tr>'
     : sessions.map(s => {
         const done = !!s.completed_at;
         const dur = done
@@ -1225,8 +1236,12 @@ app.get('/hr', requireAuth, async (req, res) => {
             ({ recommend: '✅ Рекомендовать', questionable: '⚠️ Сомнительно', reject: '❌ Не подходит' }[s.ai_verdict]) +
             ' · ' + s.ai_score + '/10</span>'
           : (done ? '<button class="ai-btn" data-sid="' + s.id + '">🤖 Анализ</button>' : '—');
+        const decLabel = s.hr_decision === 'yes' ? 'Зовём' : s.hr_decision === 'no' ? 'Не зовём' : 'Нет решения';
+        const decClass = s.hr_decision === 'yes' ? 'dec-yes' : s.hr_decision === 'no' ? 'dec-no' : 'dec-empty';
+        const decText = s.hr_decision === 'yes' ? '✓' : s.hr_decision === 'no' ? '✗' : '–';
         return '<tr id="row-' + s.id + '" data-name="' + esc(s.candidate_name) + '" data-date="' + toISO(s.created_at) + '" data-status="' + (done ? 'done' : 'active') + '">' +
           '<td><strong>' + esc(s.candidate_name) + '</strong>' + (s.notes ? ' <span class="note-badge" title="' + esc(s.notes) + '">📝</span>' : '') + '</td>' +
+          '<td style="text-align:center"><button class="dec-btn ' + decClass + '" data-sid="' + s.id + '" title="' + decLabel + '">' + decText + '</button></td>' +
           '<td><span class="local-date" data-ts="' + toISO(s.created_at) + '"></span></td>' +
           '<td>' + (done ? '<span class="status-done">Завершено</span>' : '<span class="status-prog">В процессе</span>') + '</td>' +
           '<td>' + dur + '</td>' +
@@ -1290,6 +1305,11 @@ app.get('/hr', requireAuth, async (req, res) => {
   .ai-btn{background:none;border:1px solid #e0e7ff;color:#4f46e5;font-size:.78rem;font-weight:600;padding:4px 10px;border-radius:6px;cursor:pointer;transition:background .15s}
   .ai-btn:hover{background:#e0e7ff}
   .ai-btn:disabled{opacity:.4;cursor:default}
+  .dec-btn{background:none;border:1.5px solid #e2e8f0;border-radius:6px;font-size:.95rem;font-weight:700;padding:3px 8px;cursor:pointer;transition:all .15s;min-width:32px;text-align:center}
+  .dec-yes{border-color:#bbf7d0;color:#16a34a;background:#f0fdf4}
+  .dec-no{border-color:#fecaca;color:#dc2626;background:#fff1f2}
+  .dec-empty{color:#94a3b8}
+  .dec-empty:hover{border-color:#bfdbfe;color:#2563eb}
   .editor-grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem}
   .q-block{background:white;border-radius:14px;box-shadow:0 1px 4px rgba(0,0,0,.07);overflow:hidden}
   .q-block-header{padding:1rem 1.5rem;border-bottom:1px solid #f1f5f9;display:flex;align-items:center;justify-content:space-between;gap:1rem}
@@ -1356,6 +1376,7 @@ app.get('/hr', requireAuth, async (req, res) => {
       <table>
         <thead><tr>
           <th class="sortable" onclick="sortTable('name')">Кандидат <span class="sort-icon" id="sort-name"></span></th>
+          <th style="text-align:center">Зовём</th>
           <th class="sortable" onclick="sortTable('date')">Дата начала <span class="sort-icon" id="sort-date">↓</span></th>
           <th class="sortable" onclick="sortTable('status')">Статус <span class="sort-icon" id="sort-status"></span></th>
           <th>Длительность</th><th>AI-оценка</th><th>Результаты</th><th></th>
@@ -1417,7 +1438,7 @@ app.get('/hr', requireAuth, async (req, res) => {
       </div>
       <table>
         <thead><tr>
-          <th>Кандидат</th><th>Дата начала</th><th>Статус</th><th>Длительность</th><th>Результаты</th><th></th>
+          <th>Кандидат</th><th style="text-align:center">Зовём</th><th>Дата начала</th><th>Статус</th><th>Длительность</th><th>Результаты</th><th></th>
         </tr></thead>
         <tbody id="archive-tbody">
           <tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:2rem">Загрузка...</td></tr>
@@ -1480,7 +1501,12 @@ document.addEventListener('click', function(e) {
   var abtn = e.target.closest('.arch-btn');
   if (abtn) { archiveSession(abtn.getAttribute('data-sid'), abtn.getAttribute('data-name')); return; }
   var ubtn = e.target.closest('.unarch-btn');
-  if (ubtn) unarchiveSession(ubtn.getAttribute('data-sid'), ubtn.getAttribute('data-name'));
+  if (ubtn) { unarchiveSession(ubtn.getAttribute('data-sid'), ubtn.getAttribute('data-name')); return; }
+  var dbtn = e.target.closest('.dec-btn');
+  if (dbtn) {
+    var cur = dbtn.classList.contains('dec-yes') ? 'yes' : dbtn.classList.contains('dec-no') ? 'no' : null;
+    setDecision(dbtn.getAttribute('data-sid'), cur);
+  }
 });
 
 var aiLabels = { recommend: '✅ Рекомендовать', questionable: '⚠️ Сомнительно', reject: '❌ Не подходит' };
@@ -1504,6 +1530,30 @@ async function analyzeSession(id) {
   }
 }
 
+async function setDecision(sid, current) {
+  var next = current === null ? 'yes' : current === 'yes' ? 'no' : null;
+  try {
+    var res = await fetch('/api/sessions/' + sid + '/decision', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ decision: next }),
+    });
+    if (res.status === 401) { location.href = '/hr/login'; return; }
+    if (!res.ok) throw new Error();
+    var btn = document.querySelector('.dec-btn[data-sid="' + sid + '"]');
+    if (btn) {
+      btn.className = 'dec-btn ' + (next === 'yes' ? 'dec-yes' : next === 'no' ? 'dec-no' : 'dec-empty');
+      btn.textContent = next === 'yes' ? '✓' : next === 'no' ? '✗' : '–';
+      btn.title = next === 'yes' ? 'Зовём' : next === 'no' ? 'Не зовём' : 'Нет решения';
+    }
+    var idx = archiveSessions.findIndex(function(s) { return s.id === sid; });
+    if (idx >= 0) archiveSessions[idx].hr_decision = next;
+  } catch(e) {
+    alert('Ошибка при сохранении решения');
+  }
+}
+
 async function deleteSession(id, name) {
   if (!confirm('Удалить тест кандидата «' + name + '»?\\nЭто действие нельзя отменить.')) return;
   var btn = document.querySelector('.del-btn[data-sid="' + id + '"]');
@@ -1518,7 +1568,7 @@ async function deleteSession(id, name) {
       row.remove();
       if (tbody && !tbody.querySelector('tr')) {
         var inArchive = tbody.id === 'archive-tbody';
-        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:2rem">' + (inArchive ? 'Архив пуст' : 'Нет пройденных тестов') + '</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="' + (inArchive ? '7' : '8') + '" style="text-align:center;color:#94a3b8;padding:2rem">' + (inArchive ? 'Архив пуст' : 'Нет пройденных тестов') + '</td></tr>';
       }
     }
   } catch(e) {
@@ -1540,7 +1590,7 @@ async function archiveSession(id, name) {
       var tbody = row.parentNode;
       row.remove();
       if (tbody && !tbody.querySelector('tr')) {
-        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:2rem">Нет пройденных тестов</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#94a3b8;padding:2rem">Нет пройденных тестов</td></tr>';
       }
     }
     archiveLoaded = false;
@@ -1586,7 +1636,7 @@ function filterCandidates(query) {
     if (!empty) {
       empty = document.createElement('tr');
       empty.id = 'search-empty-row';
-      empty.innerHTML = '<td colspan="7" style="text-align:center;color:#94a3b8;padding:2rem">Ничего не найдено</td>';
+      empty.innerHTML = '<td colspan="8" style="text-align:center;color:#94a3b8;padding:2rem">Ничего не найдено</td>';
     }
     document.getElementById('candidates-tbody').appendChild(empty);
   } else if (empty) {
@@ -1644,8 +1694,12 @@ function renderArchive(sessions) {
   tbody.innerHTML = sessions.map(function(s) {
     var done = !!s.completed_at;
     var dur = done ? Math.round((new Date(s.completed_at) - new Date(s.created_at)) / 60000) + ' мин' : '—';
+    var adecClass = s.hr_decision === 'yes' ? 'dec-yes' : s.hr_decision === 'no' ? 'dec-no' : 'dec-empty';
+    var adecText = s.hr_decision === 'yes' ? '✓' : s.hr_decision === 'no' ? '✗' : '–';
+    var adecLabel = s.hr_decision === 'yes' ? 'Зовём' : s.hr_decision === 'no' ? 'Не зовём' : 'Нет решения';
     return '<tr id="row-' + s.id + '">' +
       '<td><strong>' + escHtml(s.candidate_name) + '</strong></td>' +
+      '<td style="text-align:center"><button class="dec-btn ' + adecClass + '" data-sid="' + s.id + '" title="' + adecLabel + '">' + adecText + '</button></td>' +
       '<td><span class="local-date" data-ts="' + (s.created_at || '') + '"></span></td>' +
       '<td>' + (done ? '<span class="status-done">Завершено</span>' : '<span class="status-prog">В процессе</span>') + '</td>' +
       '<td>' + dur + '</td>' +

@@ -23,7 +23,8 @@ const fmtTime = (sec) => {
 };
 
 export default function Intro({ onStart, softTimeLimit = 60, hardTimeLimit = 60 }) {
-  const [name, setName] = useState('');
+  const [lastName, setLastName] = useState('');
+  const [firstName, setFirstName] = useState('');
   const [resume, setResume] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -44,8 +45,8 @@ export default function Intro({ onStart, softTimeLimit = 60, hardTimeLimit = 60 
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    const trimmed = name.trim();
-    if (!trimmed) return;
+    const trimmed = `${lastName.trim()} ${firstName.trim()}`.trim();
+    if (!lastName.trim() || !firstName.trim()) return;
     if (!resume) { setError('Пожалуйста, прикрепите резюме в формате PDF.'); return; }
 
     ensureDeviceId();
@@ -74,7 +75,7 @@ export default function Intro({ onStart, softTimeLimit = 60, hardTimeLimit = 60 
     }
   };
 
-  const canSubmit = !loading && name.trim() && resume;
+  const canSubmit = !loading && lastName.trim() && firstName.trim() && resume;
 
   return (
     <div style={styles.wrap}>
@@ -92,16 +93,31 @@ export default function Intro({ onStart, softTimeLimit = 60, hardTimeLimit = 60 
         </div>
 
         <form onSubmit={handleSubmit} style={styles.form}>
-          <label style={styles.label}>Ваше имя и фамилия</label>
-          <input
-            type="text"
-            value={name}
-            onChange={e => setName(e.target.value)}
-            placeholder="Иванов Иван"
-            style={styles.input}
-            autoFocus
-            required
-          />
+          <div style={styles.nameRow}>
+            <div style={styles.nameField}>
+              <label style={styles.label}>Фамилия</label>
+              <input
+                type="text"
+                value={lastName}
+                onChange={e => setLastName(e.target.value)}
+                placeholder="Иванов"
+                style={styles.input}
+                autoFocus
+                required
+              />
+            </div>
+            <div style={styles.nameField}>
+              <label style={styles.label}>Имя</label>
+              <input
+                type="text"
+                value={firstName}
+                onChange={e => setFirstName(e.target.value)}
+                placeholder="Иван"
+                style={styles.input}
+                required
+              />
+            </div>
+          </div>
 
           <label style={styles.label}>
             Резюме <span style={styles.required}>*</span>
@@ -198,6 +214,8 @@ const styles = {
   },
   ruleIcon: { fontSize: '1rem' },
   form: { display: 'flex', flexDirection: 'column', gap: '0.75rem' },
+  nameRow: { display: 'flex', gap: '0.75rem' },
+  nameField: { display: 'flex', flexDirection: 'column', gap: '0.75rem', flex: 1 },
   label: { fontWeight: '500', fontSize: '0.875rem', color: '#374151' },
   required: { color: '#ef4444' },
   labelHint: { fontWeight: '400', color: '#94a3b8', fontSize: '0.8rem' },
