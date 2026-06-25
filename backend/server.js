@@ -634,11 +634,11 @@ app.get('/hr/backup', requireAuth, async (req, res) => {
 });
 
 app.get('/hr/sessions/:id/resume', requireAuth, async (req, res) => {
-  const { rows } = await pool.query('SELECT resume_pdf, resume_filename FROM sessions WHERE id = $1', [req.params.id]);
+  const { rows } = await pool.query('SELECT resume_pdf, candidate_name FROM sessions WHERE id = $1', [req.params.id]);
   if (!rows[0] || !rows[0].resume_pdf) return res.status(404).send('Резюме не найдено');
-  const filename = rows[0].resume_filename || 'resume.pdf';
+  const filename = `Резюме - ${rows[0].candidate_name}.pdf`;
   res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', "inline; filename*=UTF-8''" + encodeURIComponent(filename));
+  res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
   res.send(rows[0].resume_pdf);
 });
 
