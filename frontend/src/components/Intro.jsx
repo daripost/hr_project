@@ -1,5 +1,19 @@
 import { useState, useRef } from 'react';
 
+function ensureDeviceId() {
+  const existing = document.cookie.split('; ').find(r => r.startsWith('device_id='))?.split('=')[1];
+  if (existing) return existing;
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  const id = `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+  const expires = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toUTCString();
+  document.cookie = `device_id=${id}; expires=${expires}; path=/; samesite=strict`;
+  return id;
+}
+
 const fmtTime = (sec) => {
   if (sec < 60) return sec + ' секунд';
   const m = Math.floor(sec / 60);
@@ -34,6 +48,7 @@ export default function Intro({ onStart, softTimeLimit = 60, hardTimeLimit = 60 
     if (!trimmed) return;
     if (!resume) { setError('Пожалуйста, прикрепите резюме в формате PDF.'); return; }
 
+    ensureDeviceId();
     setLoading(true);
     setError('');
     try {

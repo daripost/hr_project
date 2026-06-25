@@ -497,16 +497,21 @@ app.post('/api/sessions', upload.single('resume'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'resume is required' });
   if (req.file.mimetype !== 'application/pdf') return res.status(400).json({ error: 'resume must be a PDF file' });
   const ip = (req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || '').replace('::ffff:', '');
+  const deviceId = req.cookies.device_id || null;
   const { rows } = await pool.query('SELECT id FROM sessions WHERE LOWER(candidate_name) = LOWER($1)', [candidateName.trim()]);
   if (rows[0]) return res.status(409).json({ error: 'already_exists' });
+  if (deviceId) {
+    const { rows: devRows } = await pool.query('SELECT id FROM sessions WHERE device_id = $1 AND completed_at IS NOT NULL', [deviceId]);
+    if (devRows[0]) return res.status(409).json({ error: 'already_exists' });
+  }
   if (ip) {
     const { rows: ipRows } = await pool.query('SELECT id FROM sessions WHERE ip_address = $1 AND completed_at IS NOT NULL', [ip]);
-    if (ipRows[0]) return res.status(409).json({ error: 'already_exists_ip' });
+    if (ipRows[0]) return res.status(409).json({ error: 'already_exists' });
   }
   const id = uuidv4();
   await pool.query(
-    'INSERT INTO sessions (id, candidate_name, resume_pdf, resume_filename, ip_address) VALUES ($1, $2, $3, $4, $5)',
-    [id, candidateName.trim(), req.file.buffer, req.file.originalname, ip || null]
+    'INSERT INTO sessions (id, candidate_name, resume_pdf, resume_filename, ip_address, device_id) VALUES ($1, $2, $3, $4, $5, $6)',
+    [id, candidateName.trim(), req.file.buffer, req.file.originalname, ip || null, deviceId]
   );
   res.json({ sessionId: id });
 });

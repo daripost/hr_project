@@ -91,6 +91,7 @@ async function init() {
   await pool.query('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS resume_pdf BYTEA');
   await pool.query('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS resume_filename TEXT');
   await pool.query('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ip_address TEXT');
+  await pool.query('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS device_id TEXT');
 
   const { rows } = await pool.query('SELECT COUNT(*) AS cnt FROM questions');
   if (parseInt(rows[0].cnt) === 0) {
