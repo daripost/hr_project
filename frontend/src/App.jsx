@@ -4,18 +4,18 @@ import QuestionScreen from './components/QuestionScreen.jsx';
 import BlockTransition from './components/BlockTransition.jsx';
 import Complete from './components/Complete.jsx';
 
-// Запасной вариант если API недоступен
-import { SOFT_SKILLS, HARD_SKILLS } from './data/questions.js';
-const FALLBACK = {
-  soft: { timeLimit: 60, questions: SOFT_SKILLS },
-  hard: { timeLimit: 60, questions: HARD_SKILLS },
-};
+const fetchQuestions = (sessionId) =>
+  fetch(`/api/questions?sessionId=${sessionId}`).then(r => {
+    if (!r.ok) throw new Error('failed');
+    return r.json();
+  });
 
 const STORAGE_KEY = 'hr_assessment_done';
 
 export default function App() {
   const [screen, setScreen] = useState('loading');
   const [questions, setQuestions] = useState(null);
+  const [timeLimits, setTimeLimits] = useState({ soft: 120, hard: 120 });
   const [sessionId, setSessionId] = useState(null);
   const [candidateName, setCandidateName] = useState('');
   const [prevAttempt, setPrevAttempt] = useState(null);
@@ -28,18 +28,19 @@ export default function App() {
       try { attempt = JSON.parse(stored); setPrevAttempt(attempt); } catch { localStorage.removeItem(STORAGE_KEY); }
     }
 
-    const loadQuestions = fetch('/api/questions').then(r => r.json()).catch(() => FALLBACK);
+    const loadTimeLimits = fetch('/api/time-limits').then(r => r.json()).catch(() => ({ soft: 120, hard: 120 }));
 
     if (attempt?.sessionId && !attempt?.completedAt) {
-      // Есть незавершённая сессия — восстанавливаем прогресс
       Promise.all([
-        loadQuestions,
+        loadTimeLimits,
+        fetchQuestions(attempt.sessionId).catch(() => null),
         fetch(`/api/sessions/${attempt.sessionId}/progress`).then(r => r.json()).catch(() => null),
-      ]).then(([data, progress]) => {
-        setQuestions(data);
-        if (!progress || progress.completed) {
+      ]).then(([limits, data, progress]) => {
+        setTimeLimits(limits);
+        if (!progress || progress.completed || !data) {
           setScreen(progress?.completed ? 'already_done' : 'intro');
         } else {
+          setQuestions(data);
           setSessionId(attempt.sessionId);
           setCandidateName(attempt.name);
           setStartIndex(progress.questionIndex);
@@ -47,22 +48,19 @@ export default function App() {
         }
       });
     } else if (attempt?.completedAt) {
-      // Сессия завершена — проверяем что запись ещё в базе
       Promise.all([
-        loadQuestions,
+        loadTimeLimits,
         fetch('/api/check-device').then(r => r.json()).catch(() => ({ blocked: true })),
-      ]).then(([data, { blocked }]) => {
-        setQuestions(data);
+      ]).then(([limits, { blocked }]) => {
+        setTimeLimits(limits);
         if (!blocked) {
           localStorage.removeItem(STORAGE_KEY);
           setPrevAttempt(null);
-          setScreen('intro');
-        } else {
-          setScreen('already_done');
         }
+        setScreen(blocked ? 'already_done' : 'intro');
       });
     } else {
-      loadQuestions.then(data => { setQuestions(data); setScreen('intro'); });
+      loadTimeLimits.then(limits => { setTimeLimits(limits); setScreen('intro'); });
     }
   }, []);
 
@@ -74,11 +72,14 @@ export default function App() {
     );
   }
 
-  const handleStart = (sid, name) => {
+  const handleStart = async (sid, name) => {
     setSessionId(sid);
     setCandidateName(name);
     setStartIndex(0);
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ name, sessionId: sid, startedAt: Date.now() }));
+    const data = await fetchQuestions(sid).catch(() => null);
+    if (!data) return;
+    setQuestions(data);
     setScreen('soft');
   };
 
@@ -124,11 +125,11 @@ export default function App() {
       {screen === 'intro' && (
         <Intro
           onStart={handleStart}
-          softTimeLimit={questions.soft.timeLimit}
-          hardTimeLimit={questions.hard.timeLimit}
+          softTimeLimit={timeLimits.soft}
+          hardTimeLimit={timeLimits.hard}
         />
       )}
-      {screen === 'soft' && (
+      {screen === 'soft' && questions && (
         <QuestionScreen
           key="soft"
           block="soft"
@@ -141,11 +142,11 @@ export default function App() {
       )}
       {screen === 'transition' && (
         <BlockTransition
-          hardTimeLimit={questions.hard.timeLimit}
+          hardTimeLimit={timeLimits.hard}
           onContinue={() => { setStartIndex(0); setScreen('hard'); }}
         />
       )}
-      {screen === 'hard' && (
+      {screen === 'hard' && questions && (
         <QuestionScreen
           key="hard"
           block="hard"

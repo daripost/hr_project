@@ -463,7 +463,31 @@ app.get('/api/check-device', async (req, res) => {
   res.json({ blocked: rows.length > 0 });
 });
 
+app.get('/api/time-limits', async (req, res) => {
+  const { rows: soft } = await pool.query("SELECT time_limit FROM questions WHERE block='soft' LIMIT 1");
+  const { rows: hard } = await pool.query("SELECT time_limit FROM questions WHERE block='hard' LIMIT 1");
+  res.json({ soft: soft[0]?.time_limit ?? 120, hard: hard[0]?.time_limit ?? 120 });
+});
+
 app.get('/api/questions', async (req, res) => {
+  // HR с куком — разрешаем
+  const token = req.cookies?.hr_session;
+  if (token) {
+    const s = await dbSession.get(token);
+    if (s && Date.now() < Number(s.expires_at)) {
+      const { rows: soft } = await pool.query("SELECT text, time_limit FROM questions WHERE block='soft' ORDER BY order_index");
+      const { rows: hard } = await pool.query("SELECT text, time_limit FROM questions WHERE block='hard' ORDER BY order_index");
+      return res.json({
+        soft: { timeLimit: soft[0]?.time_limit ?? 120, questions: soft.map(q => q.text) },
+        hard: { timeLimit: hard[0]?.time_limit ?? 120, questions: hard.map(q => q.text) },
+      });
+    }
+  }
+  // Кандидат с активной сессией
+  const { sessionId } = req.query;
+  if (!sessionId) return res.status(401).json({ error: 'unauthorized' });
+  const { rows } = await pool.query('SELECT id FROM sessions WHERE id = $1 AND completed_at IS NULL', [sessionId]);
+  if (!rows[0]) return res.status(403).json({ error: 'session invalid or completed' });
   const { rows: soft } = await pool.query("SELECT text, time_limit FROM questions WHERE block='soft' ORDER BY order_index");
   const { rows: hard } = await pool.query("SELECT text, time_limit FROM questions WHERE block='hard' ORDER BY order_index");
   res.json({
