@@ -15,6 +15,8 @@ services:
       - "3001"
     environment:
       DATABASE_URL: postgres://hr_user:hr_pass@postgres:5432/hr_db
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
     depends_on:
       - postgres
     restart: unless-stopped
