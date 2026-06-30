@@ -725,6 +725,7 @@ app.post('/hr/import-db', requireAuth, upload.single('db_file'), async (req, res
 });
 
 app.post('/api/sessions/:id/analyze', requireAuth, async (req, res) => {
+  console.log('[analyze] start', req.params.id);
   const { rows: sRows } = await pool.query('SELECT * FROM sessions WHERE id = $1', [req.params.id]);
   if (!sRows[0]) return res.status(404).json({ error: 'Session not found' });
   if (!sRows[0].completed_at) return res.status(400).json({ error: 'Session not completed' });
@@ -754,9 +755,12 @@ app.post('/api/sessions/:id/analyze', requireAuth, async (req, res) => {
   let resumeText = '';
   if (sRows[0].resume_pdf) {
     try {
-      const parsed = await pdfParse(sRows[0].resume_pdf);
+      console.log('[analyze] parsing pdf, size:', sRows[0].resume_pdf.length);
+      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('pdf timeout')), 8000));
+      const parsed = await Promise.race([pdfParse(sRows[0].resume_pdf), timeout]);
       resumeText = parsed.text?.trim() || '';
-    } catch { /* игнорируем ошибку парсинга PDF */ }
+      console.log('[analyze] pdf ok, text len:', resumeText.length);
+    } catch (e) { console.log('[analyze] pdf error:', e.message); }
   }
 
   const sections = [];
@@ -771,11 +775,13 @@ app.post('/api/sessions/:id/analyze', requireAuth, async (req, res) => {
     'Ответь строго в JSON без markdown:\n' +
     '{"verdict":"recommend"|"questionable"|"reject","score":1-10,"summary":"2-3 предложения на русском"}';
 
+  console.log('[analyze] calling anthropic...');
   const message = await anthropic.messages.create({
     model: 'claude-haiku-4-5-20251001',
     max_tokens: 400,
     messages: [{ role: 'user', content: prompt }],
   });
+  console.log('[analyze] anthropic done');
 
   let result;
   try {
